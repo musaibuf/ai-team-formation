@@ -1,0 +1,18 @@
+{
+  "short_name": "Team Formation",
+  "name": "AI Team Formation | Carnelian Co",
+  "description": "Live team formation experience by Carnelian Co",
+  "icons": [
+    {
+      "src": "logo.png",
+      "type": "image/png",
+      "sizes": "any",
+      "purpose": "any"
+    }
+  ],
+  "start_url": ".",
+  "display": "standalone",
+  "orientation": "any",
+  "theme_color": "#070A14",
+  "background_color": "#070A14"
+}
