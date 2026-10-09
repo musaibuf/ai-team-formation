@@ -346,14 +346,14 @@ function ParticipantView() {
   const [revealKey, setRevealKey] = useState(0);
   const [reshuffled, setReshuffled] = useState(false);
 
-  const applyTeams = useCallback((teams, participants) => {
+  const applyTeams = useCallback((teams, participants, totalTeams) => {
     const me = participants[participantId];
     if (!me) return false;
     const myTeam = teams.find((t) => t.id === me.teamId);
     if (!myTeam) return false;
     setTeam(myTeam);
     setTeammates(myTeam.memberIds.filter((id) => id !== participantId).map((id) => participants[id]?.name).filter(Boolean));
-    writeProfile({ teamNumber: myTeam.number, teamCount: teams.length, sessionState: 'teams_formed' });
+    writeProfile({ teamNumber: myTeam.number, teamCount: totalTeams || teams.length, sessionState: 'teams_formed' });
     return true;
   }, [participantId]);
 
@@ -426,15 +426,15 @@ function ParticipantView() {
     const onConfirmed = () => setPending(false);
     const onJoinError = ({ message }) => setJoinError(message);
     const onCount = ({ count }) => setJoinedCount(count);
-    const onTeamsFormed = ({ teams, participants, reshuffled: re }) => {
-      if (applyTeams(teams, participants)) {
+    const onTeamsFormed = ({ teams, participants, reshuffled: re, teamCount }) => {
+      if (applyTeams(teams, participants, teamCount)) {
         setReshuffled(!!re);
         setRevealKey((k) => k + 1);
         setScreen('reveal');
       }
     };
-    const onTeamsUpdate = ({ teams, participants }) => {
-      if (applyTeams(teams, participants)) setScreen('reveal');
+    const onTeamsUpdate = ({ teams, participants, teamCount }) => {
+      if (applyTeams(teams, participants, teamCount)) setScreen('reveal');
     };
     const onSession = (session) => {
       writeProfile({ sessionState: session.state });
