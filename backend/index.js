@@ -315,7 +315,20 @@ function schedule(kind) {
 }
 
 const emitSession = () => io.emit('session_update', sessionObj());
-const emitTeams = (event, extra = {}) => io.emit(event, { teams: state.teams, participants: participantsObj(), ...extra });
+// Screens get the whole room. Each phone only gets its own team (about 1KB instead of
+// the full 200-person list), sent as one broadcast per team.
+function emitTeams(event, extra = {}) {
+  io.to('screens').emit(event, { teams: state.teams, participants: participantsObj(), ...extra });
+  for (const t of state.teams) {
+    if (!t.memberIds.length) continue;
+    const participants = {};
+    for (const id of t.memberIds) {
+      const p = state.participants.get(id);
+      if (p) participants[id] = { id, name: p.name, gender: p.gender, teamId: p.teamId };
+    }
+    io.to(t.memberIds.map((id) => `p:${id}`)).emit(event, { teams: [t], participants, teamCount: state.teams.length, ...extra });
+  }
+}
 
 /* ---------- re-admission after a server restart ---------- */
 
