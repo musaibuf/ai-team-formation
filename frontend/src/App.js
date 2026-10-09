@@ -698,6 +698,7 @@ function teamBlockRect(i, w, h, count = 10) {
 function ProjectorView() {
   const canvasRef = useRef(null);
   const nodesRef = useRef([]);
+  const nodeIndexRef = useRef(new Map());
   const persistentEdgesRef = useRef([]);
   const flashEdgesRef = useRef([]);
   const starsRef = useRef([]);
@@ -722,7 +723,7 @@ function ProjectorView() {
   useEffect(() => { teamsRef.current = teams; }, [teams]);
 
   const ensureNode = useCallback((id, name) => {
-    let node = nodesRef.current.find((n) => n.id === id);
+    let node = nodeIndexRef.current.get(id);
     if (!node) {
       const a = Math.random() * Math.PI * 2;
       const r = 80 + Math.random() * 160;
@@ -732,44 +733,61 @@ function ProjectorView() {
         vx: 0, vy: 0, colour: '#e8571a', radius: 6.5, answerVector: {}, pulseUntil: 0, bornAt: Date.now(),
       };
       nodesRef.current.push(node);
+      nodeIndexRef.current.set(id, node);
     } else { node.name = name; }
     return node;
   }, []);
 
-  function recomputePersistentEdges() {
+  // "Answered alike" lines. Rebuilt at most a few times a second (not on every
+  // answer) and capped to the strongest links, so big rooms stay smooth.
+  const MAX_EDGES = 1800;
+  const edgeTimerRef = useRef(null);
+  function computeEdgesNow() {
+    edgeTimerRef.current = null;
     const nodes = nodesRef.current;
-    const edges = [];
+    let edges = [];
     for (let i = 0; i < nodes.length; i++) {
+      const av = nodes[i].answerVector;
       for (let j = i + 1; j < nodes.length; j++) {
-        const a = nodes[i], b = nodes[j];
+        const bv = nodes[j].answerVector;
         let shared = 0;
-        for (const q in a.answerVector) if (b.answerVector[q] !== undefined && b.answerVector[q] === a.answerVector[q]) shared++;
-        if (shared >= 3) edges.push({ a: a.id, b: b.id, w: shared });
+        for (const q in av) if (bv[q] !== undefined && bv[q] === av[q]) shared++;
+        if (shared >= 3) edges.push({ a: nodes[i].id, b: nodes[j].id, w: shared });
       }
     }
+    if (edges.length > MAX_EDGES) edges = edges.sort((x, y) => y.w - x.w).slice(0, MAX_EDGES);
     persistentEdgesRef.current = edges;
+  }
+  function recomputePersistentEdges() {
+    if (edgeTimerRef.current) return;
+    edgeTimerRef.current = setTimeout(computeEdgesNow, 250);
   }
 
   function applyTeamPositions(teamList) {
     const { w, h } = dims.current;
     const GOLDEN_ANGLE = Math.PI * (3 - Math.sqrt(5)); // sunflower-pattern spacing
     const count = teamList.length;
+    const biggest = Math.max(1, ...teamList.map((t) => t.memberIds.length));
+    // Smaller dots when teams are many or very full, so big rooms still fit.
+    const dot = biggest > 40 ? 3.5 : biggest > 25 || count > 10 ? (biggest > 25 ? 4.2 : 5) : 6.5;
+    const byId = new Map(nodesRef.current.map((nn) => [nn.id, nn]));
     teamList.forEach((team, i) => {
       const rect = teamBlockRect(i, w, h, count);
       const headerH = count > 10 ? 26 : 34;
       const top = rect.y + headerH, bottom = rect.y + rect.h - 10;
       const cx = rect.x + rect.w / 2, cy = (top + bottom) / 2;
       const ry = ((bottom - top) / 2) * 0.82;
-      const rx = (rect.w / 2) * 0.5; // leaves room either side for name labels
+      // Normal teams leave room either side for name labels; very full teams use the whole box.
+      const rx = (rect.w / 2) * (biggest > 25 ? 0.8 : 0.5);
       const n = team.memberIds.length || 1;
       team.memberIds.forEach((pid, idx) => {
-        const node = nodesRef.current.find((nn) => nn.id === pid);
+        const node = byId.get(pid);
         if (!node) return;
         const t = (idx + 0.5) / n;
         const r = Math.sqrt(t);
         const angle = idx * GOLDEN_ANGLE;
         node.teamTarget = { x: cx + Math.cos(angle) * r * rx, y: cy + Math.sin(angle) * r * ry };
-        node.colour = team.colour; node.radius = count > 10 ? 5 : 6.5;
+        node.colour = team.colour; node.radius = dot;
       });
     });
     teamsRef.current = teamList;
@@ -801,7 +819,9 @@ function ProjectorView() {
 
     function drawTeamBlocks(w, h, now) {
       const teamCount = teamsRef.current.length;
-      const compact = teamCount > 10;
+      const biggest = Math.max(1, ...teamsRef.current.map((t) => t.memberIds.length));
+      const compact = teamCount > 10 || biggest > 25;
+      const byId = new Map(nodesRef.current.map((n) => [n.id, n]));
       teamsRef.current.forEach((t, i) => {
         const rect = teamBlockRect(i, w, h, teamCount);
 
@@ -827,12 +847,16 @@ function ProjectorView() {
         ctx.fillText(`${t.memberIds.length}`, rect.x + rect.w - 12, rect.y + (compact ? 18 : 24));
         ctx.restore();
 
-        const memberNodes = t.memberIds.map((id) => nodesRef.current.find((n) => n.id === id)).filter(Boolean);
+        const memberNodes = t.memberIds.map((id) => byId.get(id)).filter(Boolean);
 
         ctx.lineWidth = 0.7;
         ctx.strokeStyle = t.colour + '38';
+        // Full web for normal teams; for very big teams link each node to its
+        // next few neighbours so the box doesn't turn into a solid block.
+        const sparse = memberNodes.length > 25;
         for (let a = 0; a < memberNodes.length; a++) {
-          for (let b = a + 1; b < memberNodes.length; b++) {
+          const end = sparse ? Math.min(memberNodes.length, a + 4) : memberNodes.length;
+          for (let b = a + 1; b < end; b++) {
             ctx.beginPath();
             ctx.moveTo(memberNodes[a].x, memberNodes[a].y);
             ctx.lineTo(memberNodes[b].x, memberNodes[b].y);
@@ -1011,6 +1035,7 @@ function ProjectorView() {
       const ids = new Set(Object.keys(participants));
       Object.values(participants).forEach((p) => ensureNode(p.id, p.name));
       nodesRef.current = nodesRef.current.filter((n) => ids.has(n.id));
+      nodeIndexRef.current = new Map(nodesRef.current.map((n) => [n.id, n]));
     }
 
     const onState = (state) => {
@@ -1021,7 +1046,7 @@ function ProjectorView() {
       syncNodes(state.participants);
       nodesRef.current.forEach((n) => { n.answerVector = {}; });
       state.answers.forEach((a) => {
-        const node = nodesRef.current.find((n) => n.id === a.participantId);
+        const node = nodeIndexRef.current.get(a.participantId);
         if (node) node.answerVector[a.questionIndex] = a.optionIndex;
       });
       recomputePersistentEdges();
@@ -1043,7 +1068,7 @@ function ProjectorView() {
     };
 
     const onAnswer = (answer) => {
-      const node = nodesRef.current.find((n) => n.id === answer.participantId);
+      const node = nodeIndexRef.current.get(answer.participantId);
       if (node) { node.answerVector[answer.questionIndex] = answer.optionIndex; node.pulseUntil = Date.now() + 900; }
       recomputePersistentEdges();
       const peers = nodesRef.current.filter((n) => n.id !== answer.participantId && n.answerVector[answer.questionIndex] === answer.optionIndex);
@@ -1091,7 +1116,7 @@ function ProjectorView() {
     };
 
     const onReset = () => {
-      nodesRef.current = []; persistentEdgesRef.current = []; flashEdgesRef.current = [];
+      nodesRef.current = []; nodeIndexRef.current = new Map(); persistentEdgesRef.current = []; flashEdgesRef.current = [];
       setTeams([]); setSessionState('idle'); setJoinedCount(0); setSubmittedCount(0);
       stateRef.current = 'idle';
       setQrOpen(true);

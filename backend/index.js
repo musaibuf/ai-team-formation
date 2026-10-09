@@ -151,7 +151,37 @@ function makeEmptyTeams(k) {
 
 /* ---------- team building ---------- */
 
+// While teams are being built, every pair's alikeness is precomputed once into a
+// flat matrix, so the thousands of swap checks below are simple lookups.
+let simCache = null;
+
+function buildSimCache(people) {
+  const n = people.length;
+  const qn = QUESTIONS.length;
+  const W = QUESTIONS.map((q) => q.weight);
+  const vec = new Int8Array(n * qn).fill(-1);
+  people.forEach((p, i) => {
+    p._si = i;
+    const m = state.answers.get(p.id);
+    if (m) for (const [q, o] of m) vec[i * qn + q] = o;
+  });
+  const S = new Float32Array(n * n);
+  for (let i = 0; i < n; i++) {
+    for (let j = i + 1; j < n; j++) {
+      let v = 0;
+      for (let q = 0; q < qn; q++) {
+        const x = vec[i * qn + q];
+        if (x >= 0 && x === vec[j * qn + q]) v += W[q];
+      }
+      S[i * n + j] = v;
+      S[j * n + i] = v;
+    }
+  }
+  simCache = { S, n };
+}
+
 function pairSim(a, b) {
+  if (simCache) return simCache.S[a._si * simCache.n + b._si];
   const A = state.answers.get(a.id);
   const B = state.answers.get(b.id);
   if (!A || !B) return 0;
@@ -228,8 +258,13 @@ function formTeams(requested) {
   const groups = Array.from({ length: k }, () => []);
   const women = shuffle(people.filter((p) => p.gender === 'female'));
   const rest = shuffle(people.filter((p) => p.gender !== 'female'));
-  for (const p of [...women, ...rest]) groups[pickTeam(groups, p)].push(p);
-  optimise(groups);
+  buildSimCache(people);
+  try {
+    for (const p of [...women, ...rest]) groups[pickTeam(groups, p)].push(p);
+    optimise(groups);
+  } finally {
+    simCache = null;
+  }
 
   state.teams = makeEmptyTeams(k);
   groups.forEach((g, i) => {
