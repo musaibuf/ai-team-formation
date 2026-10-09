@@ -1,1683 +1,1458 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useRef, useState, useCallback } from 'react';
 import { io } from 'socket.io-client';
 import { QRCodeSVG } from 'qrcode.react';
-import { forceSimulation, forceX, forceY, forceCollide, forceManyBody } from 'd3-force';
-import {
-  ArrowRight,
-  Check,
-  ChevronLeft,
-  ChevronRight,
-  ListChecks,
-  Play,
-  Lock,
-  Maximize2,
-  Minimize2,
-  Minus,
-  Monitor,
-  Plus,
-  QrCode,
-  RotateCcw,
-  Shuffle,
-  Sparkles,
-  Users,
-  WifiOff,
-  X,
-} from 'lucide-react';
+import { Check, Minus, Monitor, Plus, RotateCcw, Shuffle, Sparkles } from 'lucide-react';
 
-/* =========================================================
-   Config
-   ========================================================= */
+/* ============================================================
+   ROUTING
+   ============================================================ */
+// Works with /projector, /?view=projector and /#projector (hash links survive any host redirect).
+function getView() {
+  const pick = (v) => {
+    const s = (v || '').toLowerCase();
+    if (['projector', 'dashboard', 'screen', 'main'].includes(s)) return 'projector';
+    if (['facilitator', 'admin', 'host'].includes(s)) return 'facilitator';
+    return null;
+  };
+  const params = new URLSearchParams(window.location.search);
+  const hash = window.location.hash.replace(/^#\/?/, '');
+  const seg = window.location.pathname.replace(/\/+$/, '').split('/').pop();
+  return pick(params.get('view')) || pick(hash) || pick(seg) || 'participant';
+}
+const VIEW = getView();
 
-const BACKEND_URL =
-  process.env.REACT_APP_BACKEND_URL || 'https://constellation-backend-4d88.onrender.com';
-const JOIN_URL = process.env.REACT_APP_JOIN_URL || `${window.location.origin}/`;
-const APP_NAME = 'AI Team Formation';
-const LOGO = `${process.env.PUBLIC_URL || ''}/logo.png`;
-const SESSION_KEY = 'aitf.participant.v1';
-const PIN_KEY = 'aitf.facilitator.pin';
-const MIN_TEAMS = 2;
-const MAX_TEAMS = 100;
-
-const socket = io(BACKEND_URL, {
-  transports: ['websocket', 'polling'],
+/* ============================================================
+   SOCKET
+   ============================================================ */
+const SERVER_URL = process.env.REACT_APP_BACKEND_URL || 'http://localhost:4000';
+// Phones identify as 'phone' so the server sends them a join counter instead of
+// the full guest list on every join.
+const SOCKET_ROLE = VIEW === 'participant' ? 'phone' : VIEW;
+const socket = io(SERVER_URL, {
+  query: { role: SOCKET_ROLE },
+  autoConnect: true,
   reconnection: true,
   reconnectionAttempts: Infinity,
-  reconnectionDelay: 800,
-  reconnectionDelayMax: 5000,
-  timeout: 20000,
+  reconnectionDelay: 1000,
+  reconnectionDelayMax: 3000, // come back fast after a phone wakes up
 });
 
-let cachedQuestions = null;
+const APP_NAME = 'AI Team Formation';
+const MIN_TEAMS = 2;
+const MAX_TEAMS = 40;
+const NUMBER_WORDS = ['Zero', 'One', 'Two', 'Three', 'Four', 'Five', 'Six', 'Seven', 'Eight', 'Nine', 'Ten',
+  'Eleven', 'Twelve', 'Thirteen', 'Fourteen', 'Fifteen', 'Sixteen', 'Seventeen', 'Eighteen', 'Nineteen', 'Twenty'];
 
-function useQuestions() {
-  const [questions, setQuestions] = useState(cachedQuestions);
-  useEffect(() => {
-    if (questions) return undefined;
-    const get = () =>
-      socket.emit('quiz:get', (res) => {
-        if (res && Array.isArray(res.questions)) {
-          cachedQuestions = res.questions;
-          setQuestions(res.questions);
-        }
-      });
-    socket.on('connect', get);
-    if (socket.connected) get();
-    return () => socket.off('connect', get);
-  }, [questions]);
-  return questions;
-}
-
-const store = {
-  get(key) {
-    try {
-      const v = window.localStorage.getItem(key);
-      return v ? JSON.parse(v) : null;
-    } catch {
-      return null;
-    }
-  },
-  set(key, val) {
-    try {
-      window.localStorage.setItem(key, JSON.stringify(val));
-    } catch {
-      /* storage unavailable */
-    }
-  },
-  del(key) {
-    try {
-      window.localStorage.removeItem(key);
-    } catch {
-      /* storage unavailable */
-    }
-  },
-};
-
-const TEAM_COLORS = [
-  '#E4572E', '#29B6F6', '#FFC857', '#7BD389', '#B388FF',
-  '#FF7AB6', '#4DD0C4', '#F4A259', '#8EA8FF', '#C5E063',
-  '#FF8A65', '#64B5F6', '#FFD54F', '#81C784', '#BA68C8',
-  '#F06292', '#4DB6AC', '#FFB74D', '#9FA8DA', '#AED581',
-];
-const teamColor = (i) =>
-  i < TEAM_COLORS.length ? TEAM_COLORS[i] : `hsl(${Math.round((i * 137.508) % 360)}, 72%, 64%)`;
-
-const NODE_COLOR = '#F4A27B';
-const TAU = Math.PI * 2;
-const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
-const rand = (a, b) => a + Math.random() * (b - a);
-
-const firstName = (name = '') => name.trim().split(/\s+/)[0] || name;
-const initials = (name = '') => {
-  const parts = name.trim().split(/\s+/).filter(Boolean);
-  return ((parts[0] || '')[0] || '').concat((parts[1] || '')[0] || '').toUpperCase() || '?';
-};
-const shortLabel = (name = '') => {
-  const parts = name.trim().split(/\s+/).filter(Boolean);
-  let first = parts[0] || '';
-  if (first.length > 12) first = `${first.slice(0, 11)}.`;
-  return parts[1] ? `${first} ${parts[1][0].toUpperCase()}.` : first;
-};
-
-function getView() {
-  const params = new URLSearchParams(window.location.search);
-  const q = (params.get('view') || '').toLowerCase();
-  const path = (window.location.pathname.replace(/\/+$/, '').split('/').pop() || '').toLowerCase();
-  const v = q || path;
-  if (['dashboard', 'screen', 'projector', 'main'].includes(v)) return 'dashboard';
-  if (['facilitator', 'admin', 'host'].includes(v)) return 'facilitator';
-  return 'participant';
-}
-
-function toggleFullscreen() {
-  try {
-    if (!document.fullscreenElement) {
-      const p = document.documentElement.requestFullscreen && document.documentElement.requestFullscreen();
-      if (p && p.catch) p.catch(() => {});
-    } else if (document.exitFullscreen) {
-      document.exitFullscreen();
-    }
-  } catch {
-    /* fullscreen not supported */
+function shuffleArr(arr) {
+  const a = arr.slice();
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
   }
+  return a;
 }
 
-/* =========================================================
-   Shared UI
-   ========================================================= */
+/* ============================================================
+   THEME
+   ============================================================ */
+const THEME_CSS = `
+  @import url('https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700;800&family=Inter:wght@400;500;600&display=swap');
+
+  :root {
+    --carnelian: #c1440e;
+    --carnelian-bright: #e8571a;
+    --gold: #e8b923;
+    --charcoal: #0b0c10;
+    --charcoal-3: #1d1f2a;
+    --ink: #f5f0e8;
+    --ink-dim: rgba(245,240,232,0.6);
+    --ink-faint: rgba(245,240,232,0.35);
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #0b0c10; }
+
+  .lc-root {
+    font-family: 'Inter', system-ui, -apple-system, sans-serif;
+    background: radial-gradient(ellipse at top, #1a1410 0%, var(--charcoal) 55%);
+    color: var(--ink); min-height: 100vh; min-height: 100dvh; width: 100%;
+    position: relative; overflow-x: hidden;
+  }
+  .lc-glow {
+    position: fixed; inset: 0; pointer-events: none; z-index: 0;
+    background:
+      radial-gradient(circle at 15% 10%, rgba(193,68,14,0.18), transparent 45%),
+      radial-gradient(circle at 85% 85%, rgba(232,185,35,0.10), transparent 40%);
+  }
+  .lc-content { position: relative; z-index: 1; }
+
+  @keyframes lc-pulse { 0%,100% { transform: scale(1); opacity:1; } 50% { transform: scale(1.4); opacity:0.5; } }
+  @keyframes lc-fadein { from { opacity:0; transform: translateY(10px); } to { opacity:1; transform:translateY(0); } }
+  @keyframes lc-pop { 0% { transform: scale(0.7); opacity:0; } 60% { transform: scale(1.06); } 100% { transform: scale(1); opacity:1; } }
+  @keyframes lc-rise { from { opacity:0; transform: translateY(14px); } to { opacity:1; transform:translateY(0); } }
+  @keyframes lc-breathe { 0%,100% { transform: scale(1); box-shadow: 0 0 40px currentColor; } 50% { transform: scale(1.05); box-shadow: 0 0 70px currentColor; } }
+
+  .lc-fadein { animation: lc-fadein 0.5s ease-out both; }
+  .lc-pop { animation: lc-pop 0.55s cubic-bezier(.2,.9,.3,1.2) both; }
+  .lc-rise { animation: lc-rise 0.5s ease-out both; }
+
+  .lc-logo { height: 56px; filter: drop-shadow(0 0 20px rgba(193,68,14,0.35)); }
+  .lc-h1 { font-family:'Poppins',sans-serif; font-weight:800; font-size:clamp(28px,6vw,48px); margin:0; letter-spacing:-0.02em; }
+  .lc-h2 { font-family:'Poppins',sans-serif; font-weight:700; font-size:clamp(20px,4.5vw,30px); margin:0 0 20px; line-height:1.3; }
+  .lc-sub { font-size:clamp(14px,3vw,17px); color:var(--ink-dim); margin:0; }
+  .lc-faint { font-size:13px; color:var(--ink-faint); margin:12px 0 0; }
+
+  .lc-card {
+    background: linear-gradient(160deg, rgba(29,31,42,0.92), rgba(20,21,29,0.92));
+    border: 1px solid rgba(255,255,255,0.07); border-radius: 20px;
+    backdrop-filter: blur(14px); box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+  }
+
+  .lc-input {
+    width:100%; padding:16px 18px; font-size:17px; border-radius:14px;
+    border:1.5px solid rgba(255,255,255,0.12); background:rgba(255,255,255,0.04);
+    color:var(--ink); text-align:center; outline:none;
+    transition:border-color .2s, box-shadow .2s;
+  }
+  .lc-input:focus { border-color:var(--carnelian-bright); box-shadow:0 0 0 4px rgba(193,68,14,0.15); }
+
+  .lc-btn {
+    padding:15px 22px; font-size:16px; font-weight:600; border-radius:14px; border:none;
+    cursor:pointer; transition:transform .15s, box-shadow .15s, opacity .15s; font-family:'Inter',sans-serif;
+    display:inline-flex; align-items:center; justify-content:center; gap:9px; text-decoration:none;
+  }
+  .lc-btn:active { transform:scale(0.97); }
+  .lc-btn:disabled { opacity:0.3; cursor:not-allowed; }
+  .lc-btn-primary { background:linear-gradient(135deg,var(--carnelian-bright),var(--carnelian)); color:#fff; box-shadow:0 6px 20px rgba(193,68,14,0.35); }
+  .lc-btn-primary:hover:not(:disabled) { box-shadow:0 10px 30px rgba(193,68,14,0.55); }
+  .lc-btn-outline { background:rgba(255,255,255,0.03); color:var(--ink); border:1.5px solid rgba(255,255,255,0.15); }
+  .lc-btn-outline:hover:not(:disabled) { border-color:rgba(255,255,255,0.4); }
+  .lc-btn-danger { background:linear-gradient(135deg,#a83232,#7a1f1f); color:#fff; box-shadow:0 6px 20px rgba(168,50,50,0.3); }
+  .lc-btn-gold { background:linear-gradient(135deg,#f0c94a,var(--gold)); color:#1a1410; box-shadow:0 6px 20px rgba(232,185,35,.35); }
+
+  .lc-option {
+    position:relative; width:100%; padding:20px 18px; font-size:17px; font-weight:500;
+    border-radius:16px; border:1.5px solid rgba(255,255,255,0.1);
+    background:rgba(255,255,255,0.03); color:var(--ink); cursor:pointer;
+    transition:all .2s; text-align:left; overflow:hidden;
+  }
+  .lc-option:hover:not(:disabled) { border-color:var(--carnelian-bright); background:rgba(193,68,14,0.08); transform:translateX(3px); }
+  .lc-option.lc-selected { background:linear-gradient(135deg,var(--carnelian-bright),var(--carnelian)); border-color:var(--carnelian-bright); color:#fff; box-shadow:0 8px 26px rgba(193,68,14,0.45); }
+  .lc-option.lc-dimmed { opacity:0.25; }
+
+  .lc-pulse-dot { width:14px; height:14px; border-radius:50%; background:var(--carnelian-bright); animation:lc-pulse 1.3s infinite ease-in-out; box-shadow:0 0 20px rgba(232,87,26,0.6); }
+  .lc-team-swatch { width:88px; height:88px; border-radius:50%; animation: lc-breathe 3s ease-in-out infinite; }
+  .lc-teammate { background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.08); border-radius:12px; padding:13px 18px; font-size:16px; font-weight:500; animation: lc-rise .45s ease-out both; }
+
+  .lc-stat-card { background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.08); border-radius:16px; padding:18px 22px; min-width:150px; flex:1 1 150px; }
+  .lc-stat-label { font-size:11px; text-transform:uppercase; letter-spacing:.08em; color:var(--ink-faint); }
+  .lc-stat-value { font-family:'Poppins',sans-serif; font-size:28px; font-weight:700; margin-top:4px; }
+
+  .lc-select { padding:14px 16px; border-radius:12px; border:1.5px solid rgba(255,255,255,0.12); background:var(--charcoal-3); color:var(--ink); font-size:14px; flex:1 1 160px; }
+
+  .lc-badge {
+    display:inline-flex; align-items:center; gap:6px; padding:6px 14px; border-radius:999px;
+    font-size:12px; font-weight:600; text-transform:uppercase; letter-spacing:.05em;
+    background:rgba(193,68,14,0.15); color:var(--carnelian-bright); border:1px solid rgba(193,68,14,0.3);
+  }
+
+  .lc-dots { display:flex; gap:7px; justify-content:center; }
+  .lc-dot { width:8px; height:8px; border-radius:50%; background:rgba(255,255,255,0.15); transition:all .3s; }
+  .lc-dot.done { background:var(--carnelian); }
+  .lc-dot.active { background:var(--gold); width:22px; border-radius:999px; box-shadow:0 0 12px rgba(232,185,35,.6); }
+
+  .lc-conn {
+    position:fixed; top:12px; right:12px; z-index:50; display:flex; align-items:center; gap:7px;
+    padding:6px 12px; border-radius:999px; font-size:11px; font-weight:600;
+    background:rgba(0,0,0,0.5); border:1px solid rgba(255,255,255,0.1); backdrop-filter:blur(8px); letter-spacing:.04em;
+  }
+  .lc-conn-dot { width:7px; height:7px; border-radius:50%; }
+
+  .lc-bar-track { height:8px; border-radius:999px; background:rgba(255,255,255,0.07); overflow:hidden; }
+  .lc-bar-fill { height:100%; border-radius:999px; background:linear-gradient(90deg,var(--carnelian),var(--gold)); transition:width .6s cubic-bezier(.2,.8,.3,1); }
+
+  .lc-modal-backdrop {
+    position:fixed; inset:0; z-index:200; display:flex; align-items:center; justify-content:center;
+    padding:20px; background:rgba(5,6,9,.72); backdrop-filter:blur(6px);
+    animation: lc-fadein .18s ease-out both;
+  }
+  .lc-modal {
+    width:100%; max-width:420px; padding:28px;
+    background: linear-gradient(160deg, rgba(31,33,45,.98), rgba(20,21,29,.98));
+    border:1px solid rgba(255,255,255,.09); border-radius:20px;
+    box-shadow:0 24px 70px rgba(0,0,0,.6);
+    animation: lc-pop .28s cubic-bezier(.2,.9,.3,1.2) both;
+  }
+  .lc-modal-title { font-family:'Poppins',sans-serif; font-weight:700; font-size:19px; margin:0 0 10px; }
+  .lc-modal-msg { font-size:14.5px; color:var(--ink-dim); line-height:1.55; margin:0 0 24px; }
+  .lc-modal-actions { display:flex; gap:10px; }
+  .lc-modal-actions > * { flex:1; }
+
+  .lc-stepper { display:grid; grid-template-columns:64px 1fr 64px; gap:10px; }
+  .lc-stepper button {
+    height:64px; border-radius:14px; border:1.5px solid rgba(255,255,255,0.15); background:rgba(255,255,255,0.04);
+    color:var(--ink); display:flex; align-items:center; justify-content:center; cursor:pointer; transition:transform .15s;
+  }
+  .lc-stepper button:active { transform:scale(.95); }
+  .lc-stepper button:disabled { opacity:.3; cursor:not-allowed; }
+  .lc-stepper input {
+    height:64px; width:100%; text-align:center; border-radius:14px; border:1.5px solid rgba(255,255,255,0.12);
+    background:rgba(255,255,255,0.04); color:var(--ink); font-family:'Poppins',sans-serif; font-size:30px; font-weight:700;
+    outline:none; -moz-appearance:textfield;
+  }
+  .lc-stepper input::-webkit-outer-spin-button, .lc-stepper input::-webkit-inner-spin-button { -webkit-appearance:none; margin:0; }
+  .lc-stepper input:focus { border-color:var(--carnelian-bright); box-shadow:0 0 0 4px rgba(193,68,14,0.15); }
+
+  .lc-section-title { font-size:14px; opacity:.75; margin:0 0 14px; letter-spacing:.05em; text-transform:uppercase; }
+
+  @media (max-width:640px) {
+    .lc-stats-row { display:grid !important; grid-template-columns:repeat(3, minmax(0,1fr)); gap:8px !important; }
+    .lc-stat-card { min-width:0; padding:12px 12px; border-radius:14px; }
+    .lc-stat-label { font-size:10px; letter-spacing:.06em; }
+    .lc-stat-value { font-size:22px; }
+    .lc-stat-value span { font-size:14px !important; }
+    .lc-btn-row { flex-direction:column; }
+    .lc-btn-row > * { width:100%; flex:1 1 auto !important; }
+    .lc-select { width:100%; flex:1 1 100%; }
+    .lc-search { width:100% !important; }
+  }
+`;
+
+function useInjectTheme() {
+  useEffect(() => {
+    if (document.getElementById('lc-theme-style')) return;
+    const style = document.createElement('style');
+    style.id = 'lc-theme-style';
+    style.textContent = THEME_CSS;
+    document.head.appendChild(style);
+  }, []);
+}
 
 function useConnection() {
   const [connected, setConnected] = useState(socket.connected);
   useEffect(() => {
     const on = () => setConnected(true);
     const off = () => setConnected(false);
-    const onVis = () => {
-      if (document.visibilityState === 'visible' && !socket.connected) socket.connect();
-    };
-    socket.on('connect', on);
-    socket.on('disconnect', off);
-    document.addEventListener('visibilitychange', onVis);
-    window.addEventListener('online', onVis);
-    return () => {
-      socket.off('connect', on);
-      socket.off('disconnect', off);
-      document.removeEventListener('visibilitychange', onVis);
-      window.removeEventListener('online', onVis);
-    };
+    socket.on('connect', on); socket.on('disconnect', off);
+    return () => { socket.off('connect', on); socket.off('disconnect', off); };
   }, []);
   return connected;
 }
 
-function Brand({ size = 40 }) {
-  const [ok, setOk] = useState(true);
-  if (!ok) {
-    return (
-      <div className="brand-fallback" style={{ width: size, height: size }}>
-        <Sparkles size={Math.round(size * 0.5)} />
-      </div>
-    );
-  }
-  return <img className="brand" src={LOGO} alt="Carnelian" style={{ height: size }} onError={() => setOk(false)} />;
-}
-
-function ConnBadge({ connected }) {
-  if (connected) return null;
+function ConnectionPill() {
+  const connected = useConnection();
   return (
-    <div className="conn-badge">
-      <WifiOff size={15} /> Reconnecting...
+    <div className="lc-conn">
+      <span className="lc-conn-dot" style={{ background: connected ? '#3ddc84' : '#ff6b6b', boxShadow: `0 0 8px ${connected ? '#3ddc84' : '#ff6b6b'}` }} />
+      <span style={{ color: connected ? 'rgba(245,240,232,.7)' : '#ff9a9a' }}>{connected ? 'LIVE' : 'RECONNECTING'}</span>
     </div>
   );
 }
 
-function Avatar({ name }) {
-  return <span className="avatar">{initials(name)}</span>;
+function ConfirmModal({ open, title, message, confirmLabel = 'Confirm', danger, onConfirm, onCancel }) {
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e) => {
+      if (e.key === 'Escape') onCancel();
+      if (e.key === 'Enter') onConfirm();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [open, onConfirm, onCancel]);
+
+  if (!open) return null;
+  return (
+    <div className="lc-modal-backdrop" onClick={onCancel}>
+      <div className="lc-modal" onClick={(e) => e.stopPropagation()}>
+        <h3 className="lc-modal-title">{title}</h3>
+        <p className="lc-modal-msg">{message}</p>
+        <div className="lc-modal-actions">
+          <button className="lc-btn lc-btn-outline" onClick={onCancel}>Cancel</button>
+          <button className={`lc-btn ${danger ? 'lc-btn-danger' : 'lc-btn-primary'}`} onClick={onConfirm}>
+            {confirmLabel}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
 }
 
-/* =========================================================
-   Participant
-   ========================================================= */
+/* ============================================================
+   PARTICIPANT VIEW (phone)
+   ============================================================ */
+// The participant id keeps someone "the same person" across a refresh, a locked
+// phone, or switching apps. Stored in localStorage, a cookie and the URL hash.
+const PID_KEY = 'aitf_participant_id';
+// Name, gender, answers and team, so a phone can put itself back in the room
+// on its own if the server ever restarts. Cleared only by a facilitator reset.
+const PROFILE_KEY = 'aitf_profile';
 
-function Participant() {
-  const connected = useConnection();
-  const questions = useQuestions();
-  const [session, setSession] = useState(() => store.get(SESSION_KEY));
-  const [me, setMe] = useState(null);
-  const [answers, setAnswers] = useState(() => {
-    const s = store.get(SESSION_KEY);
-    return (s && s.answers) || {};
-  });
-  const [reviewIdx, setReviewIdx] = useState(null);
-  const [name, setName] = useState('');
+function readStoredParticipantId() {
+  try { const v = localStorage.getItem(PID_KEY); if (v) return v; } catch (e) { /* storage blocked */ }
+  try {
+    const m = document.cookie.match(new RegExp('(?:^|; )' + PID_KEY + '=([^;]+)'));
+    if (m) return decodeURIComponent(m[1]);
+  } catch (e) { /* ignore */ }
+  const h = window.location.hash.match(/[#&]p=([^&]+)/);
+  if (h) return decodeURIComponent(h[1]);
+  return null;
+}
+
+function persistParticipantId(id) {
+  try { localStorage.setItem(PID_KEY, id); } catch (e) { /* storage blocked */ }
+  try { document.cookie = `${PID_KEY}=${encodeURIComponent(id)}; max-age=${60 * 60 * 24 * 30}; path=/; SameSite=Lax`; } catch (e) { /* ignore */ }
+  try {
+    if (window.location.pathname === '/' || window.location.pathname === '') {
+      window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}#p=${encodeURIComponent(id)}`);
+    }
+  } catch (e) { /* ignore */ }
+}
+
+function getOrCreateParticipantId() {
+  let id = readStoredParticipantId();
+  if (!id) id = 'p_' + Math.random().toString(36).slice(2) + Date.now().toString(36);
+  persistParticipantId(id);
+  return id;
+}
+
+function readProfile() {
+  try { const v = localStorage.getItem(PROFILE_KEY); return v ? JSON.parse(v) : null; } catch (e) { return null; }
+}
+function writeProfile(patch) {
+  try {
+    const next = { ...(readProfile() || {}), ...patch };
+    localStorage.setItem(PROFILE_KEY, JSON.stringify(next));
+  } catch (e) { /* storage blocked */ }
+}
+function clearProfile() {
+  try { localStorage.removeItem(PROFILE_KEY); } catch (e) { /* storage blocked */ }
+}
+
+function ParticipantView() {
+  const [participantId] = useState(getOrCreateParticipantId);
+  const [screen, setScreen] = useState('join'); // join | waiting | quiz | submitted | reveal
+  const [name, setName] = useState(() => (readProfile() || {}).name || '');
   const [gender, setGender] = useState('');
-  const [joining, setJoining] = useState(false);
-  const [error, setError] = useState('');
-  const [flash, setFlash] = useState(false);
+  const [joinError, setJoinError] = useState('');
+  const [joinedCount, setJoinedCount] = useState(0);
+  const [questions, setQuestions] = useState([]);
+  const [quizIndex, setQuizIndex] = useState(0);
+  const [answeredSet, setAnsweredSet] = useState(new Set());
+  const [locked, setLocked] = useState(false);
+  const [pending, setPending] = useState(false);
+  const [selectedOption, setSelectedOption] = useState(null);
+  const [team, setTeam] = useState(null);
+  const [teammates, setTeammates] = useState([]);
+  const [myName, setMyName] = useState('');
+  const [revealKey, setRevealKey] = useState(0);
+  const [reshuffled, setReshuffled] = useState(false);
 
-  const sessionRef = useRef(session);
-  const lastShuffle = useRef(null);
-  const flashTimer = useRef(null);
-  const advanceTimer = useRef(null);
-  const picking = useRef(false);
+  const applyTeams = useCallback((teams, participants) => {
+    const me = participants[participantId];
+    if (!me) return false;
+    const myTeam = teams.find((t) => t.id === me.teamId);
+    if (!myTeam) return false;
+    setTeam(myTeam);
+    setTeammates(myTeam.memberIds.filter((id) => id !== participantId).map((id) => participants[id]?.name).filter(Boolean));
+    writeProfile({ teamNumber: myTeam.number, teamCount: teams.length, sessionState: 'teams_formed' });
+    return true;
+  }, [participantId]);
 
+  const restoreFromState = useCallback((state) => {
+    const me = state.participants[participantId];
+    setJoinedCount(Object.keys(state.participants).length);
+    if (state.questions) setQuestions(state.questions);
+    if (!me) { clearProfile(); setTeam(null); setScreen('join'); return; }
+    setMyName(me.name);
 
-  const persist = useCallback((next) => {
-    sessionRef.current = next;
-    if (next) store.set(SESSION_KEY, next);
-    else store.del(SESSION_KEY);
-    setSession(next);
-  }, []);
+    const mine = state.answers.filter((a) => a.participantId === participantId);
+    const answersObj = {};
+    mine.forEach((a) => { answersObj[a.questionIndex] = a.optionIndex; });
+    writeProfile({
+      name: me.name, gender: me.gender, sessionId: state.session.sessionId,
+      sessionState: state.session.state, answers: answersObj,
+    });
 
-  const applyMe = useCallback(
-    (m) => {
-      if (!m) return;
-      if (m.formed) {
-        if (lastShuffle.current !== null && lastShuffle.current !== m.shuffleVersion) {
-          setFlash(true);
-          clearTimeout(flashTimer.current);
-          flashTimer.current = setTimeout(() => setFlash(false), 2600);
-        }
-        lastShuffle.current = m.shuffleVersion;
-      } else {
-        lastShuffle.current = null;
-      }
-      setMe(m);
-      const merged = { ...(m.answers || {}), ...((sessionRef.current && sessionRef.current.answers) || {}) };
-      setAnswers(merged);
-      const s = sessionRef.current;
-      if (
-        s &&
-        (s.team !== m.team ||
-          s.teamCount !== m.formedTeamCount ||
-          s.quizStarted !== m.quizStarted ||
-          JSON.stringify(s.answers || {}) !== JSON.stringify(merged))
-      ) {
-        persist({ ...s, team: m.team, teamCount: m.formedTeamCount, quizStarted: m.quizStarted, answers: merged });
-      }
-    },
-    [persist]
-  );
+    if (state.session.state === 'teams_formed' && applyTeams(state.teams, state.participants)) {
+      setScreen('reveal');
+      return;
+    }
 
-  const kick = useCallback(() => {
-    const prev = sessionRef.current;
-    if (prev && prev.name) setName(prev.name);
-    lastShuffle.current = null;
-    clearTimeout(advanceTimer.current);
-    picking.current = false;
-    setMe(null);
-    setFlash(false);
-    setAnswers({});
-    setReviewIdx(null);
-    persist(null);
-  }, [persist]);
+    if (state.session.state === 'quiz_open' || state.session.state === 'teams_formed') {
+      const doneSet = new Set(mine.map((a) => a.questionIndex));
+      setAnsweredSet(doneSet);
+      const total = state.questions.length;
+      if (doneSet.size >= total) { setScreen('submitted'); return; }
+      const firstOpen = Array.from({ length: total }).findIndex((_, i) => !doneSet.has(i));
+      setQuizIndex(firstOpen === -1 ? 0 : firstOpen);
+      setSelectedOption(null); setLocked(false);
+      setScreen('quiz');
+      return;
+    }
+    setScreen('waiting');
+  }, [participantId, applyTeams]);
+
+  // Tell the server who this phone is on every (re)connect, and pull a fresh
+  // snapshot whenever the tab comes back to the foreground.
+  useEffect(() => {
+    const identify = () => socket.emit('identify', { id: participantId, profile: readProfile() });
+    const onVisible = () => {
+      if (document.visibilityState !== 'visible') return;
+      if (!socket.connected) socket.connect();
+      else { identify(); socket.emit('request_sync'); }
+    };
+    socket.on('connect', identify);
+    if (socket.connected) identify();
+    document.addEventListener('visibilitychange', onVisible);
+    window.addEventListener('focus', onVisible);
+    window.addEventListener('pageshow', onVisible);
+    return () => {
+      socket.off('connect', identify);
+      document.removeEventListener('visibilitychange', onVisible);
+      window.removeEventListener('focus', onVisible);
+      window.removeEventListener('pageshow', onVisible);
+    };
+  }, [participantId]);
 
   useEffect(() => {
-    const rejoin = () => {
-      const s = sessionRef.current;
-      if (!s) return;
-      socket.emit('participant:rejoin', s, (res) => {
-        if (res && res.ok) applyMe(res.me);
-        else if (res && res.ok === false) kick();
-      });
+    const onJoined = (p) => {
+      if (p && p.id && p.id !== participantId) {
+        persistParticipantId(p.id);
+        window.location.reload();
+        return;
+      }
+      writeProfile({ name: p.name, sessionId: p.sessionId });
+      setMyName(p.name); setScreen('waiting');
     };
-    const onMe = (m) => {
-      const s = sessionRef.current;
-      if (s && m && m.id === s.id) applyMe(m);
+    const onConfirmed = () => setPending(false);
+    const onJoinError = ({ message }) => setJoinError(message);
+    const onCount = ({ count }) => setJoinedCount(count);
+    const onTeamsFormed = ({ teams, participants, reshuffled: re }) => {
+      if (applyTeams(teams, participants)) {
+        setReshuffled(!!re);
+        setRevealKey((k) => k + 1);
+        setScreen('reveal');
+      }
+    };
+    const onTeamsUpdate = ({ teams, participants }) => {
+      if (applyTeams(teams, participants)) setScreen('reveal');
+    };
+    const onSession = (session) => {
+      writeProfile({ sessionState: session.state });
+      if (session.state === 'quiz_open') {
+        setScreen((s) => (s === 'waiting' ? 'quiz' : s));
+      }
     };
     const onReset = () => {
-      if (sessionRef.current) kick();
+      clearProfile();
+      setScreen('join'); setQuizIndex(0); setAnsweredSet(new Set());
+      setSelectedOption(null); setLocked(false); setTeam(null); setTeammates([]); setReshuffled(false);
     };
-    socket.on('connect', rejoin);
-    socket.on('me', onMe);
-    socket.on('session:reset', onReset);
-    if (socket.connected) rejoin();
+    const onRemoved = () => {
+      clearProfile();
+      setScreen('join'); setTeam(null); setTeammates([]); setAnsweredSet(new Set());
+    };
+
+    socket.on('state_sync', restoreFromState);
+    socket.on('joined', onJoined);
+    socket.on('answer_confirmed', onConfirmed);
+    socket.on('join_error', onJoinError);
+    socket.on('room_count', onCount);
+    socket.on('teams_formed', onTeamsFormed);
+    socket.on('teams_update', onTeamsUpdate);
+    socket.on('session_update', onSession);
+    socket.on('reset', onReset);
+    socket.on('removed', onRemoved);
     return () => {
-      socket.off('connect', rejoin);
-      socket.off('me', onMe);
-      socket.off('session:reset', onReset);
+      socket.off('state_sync', restoreFromState);
+      socket.off('joined', onJoined);
+      socket.off('answer_confirmed', onConfirmed);
+      socket.off('join_error', onJoinError);
+      socket.off('room_count', onCount);
+      socket.off('teams_formed', onTeamsFormed);
+      socket.off('teams_update', onTeamsUpdate);
+      socket.off('session_update', onSession);
+      socket.off('reset', onReset);
+      socket.off('removed', onRemoved);
     };
-  }, [applyMe, kick]);
+  }, [participantId, restoreFromState, applyTeams]);
 
-  useEffect(
-    () => () => {
-      clearTimeout(flashTimer.current);
-      clearTimeout(advanceTimer.current);
-    },
-    []
-  );
-
-  const join = (e) => {
+  function handleJoin(e) {
     e.preventDefault();
-    const n = name.replace(/\s+/g, ' ').trim();
-    if (!n) return setError('Please enter your name.');
-    if (!gender) return setError('Please select your gender.');
-    if (!connected) return setError('Connecting to the server. Try again in a moment.');
-    setError('');
-    setJoining(true);
-    socket.timeout(10000).emit('participant:join', { name: n, gender }, (err, res) => {
-      setJoining(false);
-      if (err) return setError('The server did not respond. Please try again.');
-      if (!res || !res.ok) return setError((res && res.error) || 'Could not join. Please try again.');
-      persist({
-        id: res.id,
-        epoch: res.epoch,
-        name: n,
-        gender,
-        team: res.me ? res.me.team : null,
-        teamCount: res.me ? res.me.formedTeamCount : 0,
-        quizStarted: res.me ? res.me.quizStarted : false,
-        answers: {},
+    const trimmed = name.trim();
+    if (trimmed.length === 0 || trimmed.length > 20) { setJoinError('Enter 1-20 characters.'); return; }
+    if (!gender) { setJoinError('Please select your gender.'); return; }
+    setJoinError('');
+    writeProfile({ name: trimmed, gender, answers: {} });
+    socket.emit('join', { id: participantId, name: trimmed, gender });
+  }
+
+  function handleAnswer(optionIndex) {
+    if (locked) return;
+    setSelectedOption(optionIndex); setLocked(true); setPending(true);
+    const qi = quizIndex;
+    const prev = readProfile() || {};
+    writeProfile({ answers: { ...(prev.answers || {}), [qi]: optionIndex } });
+    socket.emit('submit_answer', { participantId, questionIndex: qi, optionIndex });
+
+    setTimeout(() => {
+      setAnsweredSet((prevSet) => {
+        const next = new Set(prevSet); next.add(qi);
+        if (next.size >= questions.length) { setScreen((s) => (s === 'quiz' ? 'submitted' : s)); }
+        else {
+          const nextOpen = Array.from({ length: questions.length }).findIndex((_, i) => !next.has(i));
+          setQuizIndex(nextOpen === -1 ? 0 : nextOpen);
+          setSelectedOption(null); setLocked(false);
+        }
+        return next;
       });
-      applyMe(res.me);
-    });
-  };
-
-  const pick = (idx, option) => {
-    const s = sessionRef.current;
-    if (!s || !questions || picking.current) return;
-    const q = questions[idx];
-    const next = { ...answers, [q.id]: option };
-    picking.current = true;
-    setAnswers(next);
-    persist({ ...s, answers: next });
-    socket.emit('participant:answer', { id: s.id, epoch: s.epoch, qid: q.id, option }, (res) => {
-      if (res && res.reason === 'reset') kick();
-    });
-    clearTimeout(advanceTimer.current);
-    advanceTimer.current = setTimeout(() => {
-      picking.current = false;
-      const n = idx + 1;
-      setReviewIdx(n < questions.length && next[questions[n].id] != null ? n : null);
-    }, 320);
-  };
-
-  if (!session) {
-    return (
-      <div className="screen center">
-        <div className="card join-card">
-          <Brand size={44} />
-          <div className="eyebrow">Live session</div>
-          <h1 className="title">{APP_NAME}</h1>
-          <p className="muted">Enter your details to appear on the main screen.</p>
-          <form className="form" onSubmit={join} noValidate>
-            <label className="field">
-              <span>Your name</span>
-              <input
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-                placeholder="e.g. Sara Ahmed"
-                maxLength={40}
-                autoComplete="name"
-                autoCapitalize="words"
-              />
-            </label>
-            <div className="field">
-              <span>Gender</span>
-              <div className="seg">
-                <button type="button" className={gender === 'male' ? 'on' : ''} onClick={() => setGender('male')}>
-                  Male
-                </button>
-                <button type="button" className={gender === 'female' ? 'on' : ''} onClick={() => setGender('female')}>
-                  Female
-                </button>
-              </div>
-            </div>
-            {error && <div className="error">{error}</div>}
-            <button className="btn primary block lg" type="submit" disabled={joining}>
-              {joining ? (
-                <span className="spinner" />
-              ) : (
-                <>
-                  Join <ArrowRight size={18} />
-                </>
-              )}
-            </button>
-          </form>
-        </div>
-        <ConnBadge connected={connected} />
-      </div>
-    );
+      setPending(false);
+    }, 550); // brief pause so the "locked in" state is visible before advancing
   }
 
-  const hasTeam = me && me.formed && me.team != null;
-
-  if (hasTeam) {
-    const color = teamColor(me.team);
-    return (
-      <div className="screen center team-screen" style={{ '--team': color }}>
-        {flash && (
-          <div className="toast ok">
-            <Shuffle size={16} /> Teams reshuffled
-          </div>
-        )}
-        <div className="card team-card" key={me.shuffleVersion}>
-          <Brand size={32} />
-          <div className="eyebrow">Your team</div>
-          <div className="team-swatch" />
-          <div className="team-badge">Team {me.teamNumber}</div>
-          <div className="team-meta">{me.teammates.length + 1} members</div>
-          <div className="mates">
-            <div className="mate self">
-              <Avatar name={session.name} />
-              <span className="mate-name">{session.name}</span>
-              <em>You</em>
-            </div>
-            {me.teammates.map((n, i) => (
-              <div className="mate" key={`${n}-${i}`}>
-                <Avatar name={n} />
-                <span className="mate-name">{n}</span>
-              </div>
-            ))}
-          </div>
-          <p className="muted small">Find your teammates in the room. This screen updates automatically.</p>
-        </div>
-        <ConnBadge connected={connected} />
-      </div>
-    );
-  }
-
-  const quizStarted = me ? me.quizStarted : !!session.quizStarted;
-  const firstUnanswered = questions ? questions.findIndex((q) => answers[q.id] == null) : -1;
-  const answeredTotal = questions ? questions.filter((q) => answers[q.id] != null).length : 0;
-  const idx = reviewIdx != null ? reviewIdx : firstUnanswered;
-
-  if (quizStarted && questions && idx !== -1) {
-    const q = questions[idx];
-    return (
-      <div className="screen center">
-        <div className="card quiz-card" key={q.id}>
-          <div className="quiz-top">
-            {idx > 0 ? (
-              <button type="button" className="link-btn" onClick={() => setReviewIdx(idx - 1)}>
-                <ChevronLeft size={16} /> Back
-              </button>
-            ) : (
-              <span />
-            )}
-            <span className="quiz-count">
-              {idx + 1} of {questions.length}
-            </span>
-          </div>
-          <div className="progress">
-            <i style={{ width: `${(answeredTotal / questions.length) * 100}%` }} />
-          </div>
-          <h2 className="quiz-q">{q.text}</h2>
-          <div className="opts">
-            {q.options.map((o, i) => {
-              const on = answers[q.id] === i;
-              return (
-                <button type="button" key={o} className={`opt ${on ? 'on' : ''}`} onClick={() => pick(idx, i)}>
-                  <span className="opt-key">{String.fromCharCode(65 + i)}</span>
-                  <span className="opt-text">{o}</span>
-                  {on && <Check size={18} className="opt-check" />}
-                </button>
-              );
-            })}
-          </div>
-        </div>
-        <ConnBadge connected={connected} />
-      </div>
-    );
-  }
-
-  const quizDone = quizStarted && questions && firstUnanswered === -1;
+  const question = questions[quizIndex];
 
   return (
-    <div className="screen center">
-      <div className="card wait-card">
-        <Brand size={36} />
-        <div className="orbit">
-          <span className="ring r1" />
-          <span className="ring r2" />
-          <span className="core" />
-        </div>
-        <h2 className="title sm">{quizDone ? 'All done' : `You're in, ${firstName(session.name)}`}</h2>
-        <p className="muted">
-          {quizDone
-            ? 'Your answers are in. Watch the main screen, your team will appear here shortly.'
-            : 'Your node is live on the main screen. A few quick questions will appear here soon.'}
-        </p>
-        {quizDone && (
-          <button type="button" className="link-btn" onClick={() => setReviewIdx(0)}>
-            <ChevronLeft size={16} /> Review my answers
-          </button>
+    <div className="lc-root">
+      <div className="lc-glow" />
+      <ConnectionPill />
+      <div className="lc-content" style={{ minHeight: '100dvh', display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '32px 20px 48px', maxWidth: 480, margin: '0 auto' }}>
+        <img src="/logo.png" alt="Carnelian" className="lc-logo" style={{ marginBottom: 24 }} />
+
+        {screen === 'join' && (
+          <form onSubmit={handleJoin} className="lc-fadein" style={{ width: '100%', textAlign: 'center' }}>
+            <span className="lc-badge" style={{ marginBottom: 18, display: 'inline-flex' }}><Sparkles size={13} /> {APP_NAME}</span>
+            <h1 className="lc-h1" style={{ marginBottom: 10 }}>Join the room</h1>
+            <p className="lc-sub" style={{ marginBottom: 26 }}>First name plus last initial</p>
+            <input className="lc-input" value={name} maxLength={20} placeholder="e.g. Ahmed K"
+              onChange={(e) => setName(e.target.value)} autoComplete="off" />
+            <div style={{ display: 'flex', gap: 10, marginTop: 14 }}>
+              {[['male', 'Male'], ['female', 'Female']].map(([val, label]) => (
+                <button key={val} type="button" onClick={() => setGender(val)}
+                  className={`lc-option ${gender === val ? 'lc-selected' : ''}`}
+                  style={{ textAlign: 'center', padding: '16px 12px' }}>
+                  {label}
+                </button>
+              ))}
+            </div>
+            {joinError && <p style={{ color: '#ff6b6b', fontSize: 14, marginTop: 10 }}>{joinError}</p>}
+            <button className="lc-btn lc-btn-primary" type="submit" style={{ width: '100%', marginTop: 18 }}>Join now</button>
+            {joinedCount > 0 && <p className="lc-faint">{joinedCount} already in the room</p>}
+          </form>
         )}
-        <div className="stat-pill">
-          <Users size={16} /> {me ? me.total : '...'} joined
-        </div>
+
+        {screen === 'waiting' && (
+          <div className="lc-pop" style={{ textAlign: 'center', marginTop: 50, width: '100%' }}>
+            <div className="lc-pulse-dot" style={{ margin: '0 auto 24px' }} />
+            <h1 className="lc-h1">You're in</h1>
+            {myName && <p className="lc-sub" style={{ marginTop: 8, color: 'var(--gold)' }}>{myName}</p>}
+            <div className="lc-card" style={{ padding: '22px 24px', marginTop: 28 }}>
+              <div style={{ fontFamily: "'Poppins',sans-serif", fontSize: 44, fontWeight: 800 }}>{joinedCount}</div>
+              <div className="lc-stat-label">people have joined</div>
+            </div>
+            <p className="lc-faint">Look up at the screen. Waiting for the facilitator to start.</p>
+          </div>
+        )}
+
+        {screen === 'quiz' && question && (
+          <div className="lc-fadein" style={{ width: '100%' }}>
+            <div className="lc-dots" style={{ marginBottom: 22 }}>
+              {questions.map((_, i) => (
+                <span key={i} className={`lc-dot ${answeredSet.has(i) ? 'done' : ''} ${i === quizIndex ? 'active' : ''}`} />
+              ))}
+            </div>
+            <h2 className="lc-h2">{question.text}</h2>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+              {question.options.map((opt, i) => (
+                <button key={`${quizIndex}-${i}`} disabled={locked} onClick={() => handleAnswer(i)} style={{ animationDelay: `${i * 60}ms` }}
+                  className={`lc-option lc-rise ${selectedOption === i ? 'lc-selected' : ''} ${locked && selectedOption !== i ? 'lc-dimmed' : ''}`}>
+                  {opt}
+                </button>
+              ))}
+            </div>
+            {locked && (
+              <div className="lc-fadein" style={{ textAlign: 'center', marginTop: 22 }}>
+                <span className="lc-badge">{pending ? 'Sending...' : <><Check size={13} /> Locked in</>}</span>
+              </div>
+            )}
+          </div>
+        )}
+
+        {screen === 'submitted' && (
+          <div className="lc-pop" style={{ textAlign: 'center', marginTop: 50, width: '100%' }}>
+            <div className="lc-pulse-dot" style={{ margin: '0 auto 24px', background: 'var(--gold)', boxShadow: '0 0 20px rgba(232,185,35,.6)' }} />
+            <h1 className="lc-h1">All done</h1>
+            <p className="lc-sub" style={{ marginTop: 10 }}>You've answered all {questions.length} questions.</p>
+            <p className="lc-faint">Look up at the screen. Waiting for everyone else to finish.</p>
+          </div>
+        )}
+
+        {screen === 'reveal' && team && (
+          <div key={revealKey} style={{ textAlign: 'center', width: '100%' }}>
+            <p className="lc-faint lc-fadein" style={{ marginTop: 0 }}>{reshuffled ? 'Teams were reshuffled. Your team is' : 'Your team is'}</p>
+            <h1 className="lc-h1 lc-pop" style={{ color: team.colour, margin: '8px 0 26px' }}>Team {team.number}</h1>
+            <div className="lc-team-swatch lc-pop" style={{ background: `radial-gradient(circle at 35% 30%, #fff2, ${team.colour})`, color: team.colour, margin: '0 auto 30px' }} />
+            <p className="lc-sub" style={{ marginBottom: 14 }}>
+              {teammates.length > 0 ? `Your ${teammates.length} teammates` : 'Your teammates'}
+            </p>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+              {teammates.length > 0 ? (
+                teammates.map((n, i) => <div key={`${n}-${i}`} className="lc-teammate" style={{ animationDelay: `${i * 55}ms`, borderLeft: `3px solid ${team.colour}` }}>{n}</div>)
+              ) : (
+                <div className="lc-teammate" style={{ opacity: 0.6, fontStyle: 'italic' }}>No one else on your team yet</div>
+              )}
+            </div>
+            <p className="lc-faint">Keep this screen. It's how you find your group.</p>
+          </div>
+        )}
       </div>
-      <ConnBadge connected={connected} />
     </div>
   );
 }
 
-/* =========================================================
-   Facilitator
-   ========================================================= */
+/* ============================================================
+   PROJECTOR VIEW
+   ============================================================ */
+const QR_PANEL_WIDTH = 300;
+const TOP_BAR_HEIGHT = 60;
 
-function Facilitator() {
-  const connected = useConnection();
-  const [authed, setAuthed] = useState(false);
-  const [needPin, setNeedPin] = useState(false);
-  const [pin, setPin] = useState('');
-  const [pinError, setPinError] = useState('');
-  const [st, setSt] = useState(null);
-  const [count, setCount] = useState(4);
-  const [countText, setCountText] = useState('4');
-  const [busy, setBusy] = useState(false);
-  const [toast, setToast] = useState(null);
-  const [confirmReset, setConfirmReset] = useState(false);
-  const countInit = useRef(false);
-  const toastTimer = useRef(null);
+function QrIcon({ size = 16 }) {
+  return (
+    <svg viewBox="0 0 24 24" width={size} height={size} fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round">
+      <rect x="3" y="3" width="7" height="7" rx="1" /><rect x="14" y="3" width="7" height="7" rx="1" /><rect x="3" y="14" width="7" height="7" rx="1" />
+      <path d="M14 14h3v3h-3zM20 14v.01M14 20h.01M17 20h4v-3" />
+    </svg>
+  );
+}
 
+// Docked to the right edge under the top bar, not centred, so the room can
+// still watch the nodes arrive while late joiners scan.
+function QrPanel({ open, onClose, joinUrl }) {
+  if (!open) return null;
+  return (
+    <div className="lc-fadein" style={{
+      position: 'absolute', top: TOP_BAR_HEIGHT + 2, right: 0, width: QR_PANEL_WIDTH, zIndex: 20,
+      padding: '22px 22px 20px', background: 'rgba(13,14,18,.94)', borderLeft: '1px solid rgba(232,87,26,.4)',
+      borderBottom: '1px solid rgba(232,87,26,.4)', borderBottomLeftRadius: 18,
+      display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 14,
+      fontFamily: "'Inter',sans-serif", backdropFilter: 'blur(10px)',
+    }}>
+      <button onClick={onClose} aria-label="Close QR code" style={{
+        position: 'absolute', top: 10, right: 10, width: 30, height: 30, borderRadius: '50%',
+        border: '1px solid rgba(255,255,255,.2)', background: 'rgba(255,255,255,.05)', color: '#f5f0e8',
+        cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
+      }}>
+        <svg viewBox="0 0 24 24" width={14} height={14} fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round"><path d="M6 6l12 12M18 6L6 18" /></svg>
+      </button>
+      <div style={{ fontSize: 11, letterSpacing: '.16em', textTransform: 'uppercase', color: 'rgba(232,185,35,.85)', fontWeight: 600 }}>Scan to join</div>
+      <div style={{ padding: 14, borderRadius: 16, background: '#fdfaf5', boxShadow: '0 0 40px rgba(232,185,35,.2)' }}>
+        <QRCodeSVG value={joinUrl} size={QR_PANEL_WIDTH - 72} bgColor="#fdfaf5" fgColor="#14100c" level="M" />
+      </div>
+      <p style={{ margin: 0, fontSize: 13, color: 'rgba(245,240,232,.6)', textAlign: 'center', wordBreak: 'break-all' }}>
+        {joinUrl.replace(/^https?:\/\//, '').replace(/\/$/, '')}
+      </p>
+    </div>
+  );
+}
 
-  const showToast = useCallback((type, text) => {
-    setToast({ type, text });
-    clearTimeout(toastTimer.current);
-    toastTimer.current = setTimeout(() => setToast(null), 2600);
+function pathRoundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+// Shrinks text with an ellipsis until it fits maxWidth.
+function truncateToWidth(ctx, text, maxWidth) {
+  if (!text) return '';
+  if (ctx.measureText(text).width <= maxWidth) return text;
+  let t = text;
+  while (t.length > 1 && ctx.measureText(t + '…').width > maxWidth) t = t.slice(0, -1);
+  return t + '…';
+}
+
+// Grid for any team count: one row up to 5 teams, two rows up to 10,
+// 5 columns up to 20, then as square as the screen allows.
+function gridFor(count, w, h) {
+  let rows;
+  if (count <= 5) rows = 1;
+  else if (count <= 10) rows = 2;
+  else if (count <= 20) rows = Math.ceil(count / 5);
+  else rows = Math.max(1, Math.round(Math.sqrt(count / ((w / Math.max(1, h)) * 1.1))));
+  return { rows, cols: Math.ceil(count / rows) };
+}
+
+function teamBlockRect(i, w, h, count = 10) {
+  const { rows, cols } = gridFor(count, w, h);
+  const topOffset = TOP_BAR_HEIGHT + 14;
+  const margin = Math.max(16, w * 0.012);
+  const gutter = rows > 2 ? 10 : 14;
+  const cellW = (w - margin * 2 - gutter * (cols - 1)) / cols;
+  const cellH = (h - topOffset - margin - gutter * (rows - 1)) / rows;
+  const col = i % cols, row = Math.floor(i / cols);
+  return { x: margin + col * (cellW + gutter), y: topOffset + row * (cellH + gutter), w: cellW, h: cellH };
+}
+
+function ProjectorView() {
+  const canvasRef = useRef(null);
+  const nodesRef = useRef([]);
+  const persistentEdgesRef = useRef([]);
+  const flashEdgesRef = useRef([]);
+  const starsRef = useRef([]);
+  const teamsRef = useRef([]);
+  const stateRef = useRef('idle');
+  const rafRef = useRef(null);
+  const lastFrameTsRef = useRef(null);
+  const dims = useRef({ w: window.innerWidth, h: window.innerHeight });
+
+  const [sessionState, setSessionState] = useState('idle');
+  const [joinedCount, setJoinedCount] = useState(0);
+  const [submittedCount, setSubmittedCount] = useState(0);
+  const [teams, setTeams] = useState([]);
+  const [showFormingBanner, setShowFormingBanner] = useState(false);
+  const [qrOpen, setQrOpen] = useState(true);
+  const qrOpenRef = useRef(true);
+  useEffect(() => { qrOpenRef.current = qrOpen; }, [qrOpen]);
+
+  const joinUrl = process.env.REACT_APP_JOIN_URL || `${window.location.origin}/`;
+
+  useEffect(() => { stateRef.current = sessionState; }, [sessionState]);
+  useEffect(() => { teamsRef.current = teams; }, [teams]);
+
+  const ensureNode = useCallback((id, name) => {
+    let node = nodesRef.current.find((n) => n.id === id);
+    if (!node) {
+      const a = Math.random() * Math.PI * 2;
+      const r = 80 + Math.random() * 160;
+      node = {
+        id, name,
+        x: dims.current.w / 2 + Math.cos(a) * r, y: dims.current.h / 2 + Math.sin(a) * r,
+        vx: 0, vy: 0, colour: '#e8571a', radius: 6.5, answerVector: {}, pulseUntil: 0, bornAt: Date.now(),
+      };
+      nodesRef.current.push(node);
+    } else { node.name = name; }
+    return node;
   }, []);
 
-  const auth = useCallback((p, manual) => {
-    socket.emit('facilitator:auth', { pin: p || '' }, (res) => {
-      if (res && res.ok) {
-        setAuthed(true);
-        setNeedPin(false);
-        setPinError('');
-        if (p) store.set(PIN_KEY, p);
-        setSt(res.state);
-        if (!countInit.current && res.state) {
-          countInit.current = true;
-          setCount(res.state.teamCount);
-          setCountText(String(res.state.teamCount));
-        }
-      } else {
-        setAuthed(false);
-        setNeedPin(true);
-        if (manual) setPinError('Incorrect PIN');
-        else store.del(PIN_KEY);
+  function recomputePersistentEdges() {
+    const nodes = nodesRef.current;
+    const edges = [];
+    for (let i = 0; i < nodes.length; i++) {
+      for (let j = i + 1; j < nodes.length; j++) {
+        const a = nodes[i], b = nodes[j];
+        let shared = 0;
+        for (const q in a.answerVector) if (b.answerVector[q] !== undefined && b.answerVector[q] === a.answerVector[q]) shared++;
+        if (shared >= 3) edges.push({ a: a.id, b: b.id, w: shared });
       }
+    }
+    persistentEdgesRef.current = edges;
+  }
+
+  function applyTeamPositions(teamList) {
+    const { w, h } = dims.current;
+    const GOLDEN_ANGLE = Math.PI * (3 - Math.sqrt(5)); // sunflower-pattern spacing
+    const count = teamList.length;
+    teamList.forEach((team, i) => {
+      const rect = teamBlockRect(i, w, h, count);
+      const headerH = count > 10 ? 26 : 34;
+      const top = rect.y + headerH, bottom = rect.y + rect.h - 10;
+      const cx = rect.x + rect.w / 2, cy = (top + bottom) / 2;
+      const ry = ((bottom - top) / 2) * 0.82;
+      const rx = (rect.w / 2) * 0.5; // leaves room either side for name labels
+      const n = team.memberIds.length || 1;
+      team.memberIds.forEach((pid, idx) => {
+        const node = nodesRef.current.find((nn) => nn.id === pid);
+        if (!node) return;
+        const t = (idx + 0.5) / n;
+        const r = Math.sqrt(t);
+        const angle = idx * GOLDEN_ANGLE;
+        node.teamTarget = { x: cx + Math.cos(angle) * r * rx, y: cy + Math.sin(angle) * r * ry };
+        node.colour = team.colour; node.radius = count > 10 ? 5 : 6.5;
+      });
     });
+    teamsRef.current = teamList;
+  }
+
+  function clearTeamLook() {
+    nodesRef.current.forEach((n) => { n.teamTarget = null; n.colour = '#e8571a'; n.radius = 6.5; });
+  }
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext('2d');
+
+    function seedStars() {
+      const { w, h } = dims.current;
+      starsRef.current = Array.from({ length: 180 }, () => ({ x: Math.random() * w, y: Math.random() * h, r: Math.random() * 1.3 + 0.3, tw: Math.random() * Math.PI * 2, sp: 0.4 + Math.random() * 1.2 }));
+    }
+    function resize() {
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      dims.current = { w: window.innerWidth, h: window.innerHeight };
+      canvas.width = dims.current.w * dpr; canvas.height = dims.current.h * dpr;
+      canvas.style.width = dims.current.w + 'px'; canvas.style.height = dims.current.h + 'px';
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      seedStars();
+      if (stateRef.current === 'teams_formed' && teamsRef.current.length) applyTeamPositions(teamsRef.current);
+    }
+    resize();
+    window.addEventListener('resize', resize);
+
+    function drawTeamBlocks(w, h, now) {
+      const teamCount = teamsRef.current.length;
+      const compact = teamCount > 10;
+      teamsRef.current.forEach((t, i) => {
+        const rect = teamBlockRect(i, w, h, teamCount);
+
+        ctx.save();
+        pathRoundRect(ctx, rect.x, rect.y, rect.w, rect.h, compact ? 12 : 16);
+        ctx.fillStyle = 'rgba(255,255,255,0.025)';
+        ctx.fill();
+        ctx.lineWidth = 1.5;
+        ctx.strokeStyle = t.colour + '77';
+        ctx.shadowColor = t.colour;
+        ctx.shadowBlur = 12;
+        ctx.stroke();
+        ctx.restore();
+
+        ctx.save();
+        ctx.font = compact ? "700 12px Poppins, system-ui, sans-serif" : "700 15px Poppins, system-ui, sans-serif";
+        ctx.fillStyle = t.colour;
+        ctx.textAlign = 'left';
+        ctx.fillText(`TEAM ${t.number}`, rect.x + 12, rect.y + (compact ? 18 : 24));
+        ctx.font = "500 11px Inter, system-ui, sans-serif";
+        ctx.fillStyle = 'rgba(245,240,232,.4)';
+        ctx.textAlign = 'right';
+        ctx.fillText(`${t.memberIds.length}`, rect.x + rect.w - 12, rect.y + (compact ? 18 : 24));
+        ctx.restore();
+
+        const memberNodes = t.memberIds.map((id) => nodesRef.current.find((n) => n.id === id)).filter(Boolean);
+
+        ctx.lineWidth = 0.7;
+        ctx.strokeStyle = t.colour + '38';
+        for (let a = 0; a < memberNodes.length; a++) {
+          for (let b = a + 1; b < memberNodes.length; b++) {
+            ctx.beginPath();
+            ctx.moveTo(memberNodes[a].x, memberNodes[a].y);
+            ctx.lineTo(memberNodes[b].x, memberNodes[b].y);
+            ctx.stroke();
+          }
+        }
+
+        memberNodes.forEach((n) => {
+          const entry = Math.max(0, Math.min(1, (now - n.bornAt) / 600));
+          const r = n.radius * entry;
+          ctx.beginPath();
+          ctx.arc(n.x, n.y, r, 0, Math.PI * 2);
+          ctx.shadowColor = n.colour; ctx.shadowBlur = 9;
+          ctx.fillStyle = n.colour; ctx.fill(); ctx.shadowBlur = 0;
+
+          ctx.font = compact ? "500 9px Inter, system-ui, sans-serif" : "500 10px Inter, system-ui, sans-serif";
+          ctx.fillStyle = `rgba(245,240,232,${0.7 * entry})`;
+          const boxCenterX = rect.x + rect.w / 2;
+          const pad = 8;
+          if (n.x < boxCenterX) {
+            ctx.textAlign = 'left';
+            const maxWidth = (rect.x + rect.w - pad) - (n.x + r + 4);
+            ctx.fillText(truncateToWidth(ctx, n.name, Math.max(24, maxWidth)), n.x + r + 4, n.y + 3);
+          } else {
+            ctx.textAlign = 'right';
+            const maxWidth = (n.x - r - 4) - (rect.x + pad);
+            ctx.fillText(truncateToWidth(ctx, n.name, Math.max(24, maxWidth)), n.x - r - 4, n.y + 3);
+          }
+        });
+      });
+    }
+
+    function draw(ts) {
+      rafRef.current = requestAnimationFrame(draw);
+      try {
+        const { w, h } = dims.current;
+        const now = Date.now();
+        const dt = Math.min(lastFrameTsRef.current ? (ts - lastFrameTsRef.current) / 1000 : 0.016, 0.05);
+        lastFrameTsRef.current = ts;
+
+        // Gathering phase (joining + self-paced quiz): nodes roam freely and
+        // gently repel each other. Also runs during the brief scatter right
+        // after teams are formed, before each node has its team target.
+        const isGathering = stateRef.current === 'idle' || stateRef.current === 'populating' || stateRef.current === 'quiz_open';
+        const isScattering = stateRef.current === 'teams_formed' && nodesRef.current.some((n) => !n.teamTarget);
+        if (isGathering || isScattering) {
+          const top = TOP_BAR_HEIGHT + 20;
+          const nodes = nodesRef.current;
+
+          nodes.forEach((n) => {
+            if (n.wanderVx === undefined) {
+              const angle = Math.random() * Math.PI * 2;
+              const speed = 40 + Math.random() * 30;
+              n.wanderVx = Math.cos(angle) * speed;
+              n.wanderVy = Math.sin(angle) * speed;
+            }
+            n.wanderVx += (Math.random() - 0.5) * 30 * dt;
+            n.wanderVy += (Math.random() - 0.5) * 30 * dt;
+          });
+
+          for (let i = 0; i < nodes.length; i++) {
+            for (let j = i + 1; j < nodes.length; j++) {
+              const a = nodes[i], b = nodes[j];
+              const dx = b.x - a.x, dy = b.y - a.y;
+              const distSq = dx * dx + dy * dy;
+              const minDist = 46;
+              if (distSq < minDist * minDist && distSq > 0.01) {
+                const dist = Math.sqrt(distSq);
+                const push = (minDist - dist) * 1.6 * dt;
+                const nx = dx / dist, ny = dy / dist;
+                a.wanderVx -= nx * push; a.wanderVy -= ny * push;
+                b.wanderVx += nx * push; b.wanderVy += ny * push;
+              }
+            }
+          }
+
+          nodes.forEach((n) => {
+            if (n.teamTarget) return;
+            n.wanderVx *= Math.pow(0.4, dt);
+            n.wanderVy *= Math.pow(0.4, dt);
+            const speedNow = Math.hypot(n.wanderVx, n.wanderVy);
+            const minSpeed = 28, maxSpeed = 85;
+            if (speedNow > 0.01 && speedNow < minSpeed) {
+              const boost = minSpeed / speedNow;
+              n.wanderVx *= boost; n.wanderVy *= boost;
+            } else if (speedNow > maxSpeed) {
+              n.wanderVx = (n.wanderVx / speedNow) * maxSpeed;
+              n.wanderVy = (n.wanderVy / speedNow) * maxSpeed;
+            }
+            n.x += n.wanderVx * dt;
+            n.y += n.wanderVy * dt;
+            const r = n.radius + 8;
+            // Keep roaming nodes out from behind the docked QR panel.
+            const rightWall = qrOpenRef.current ? w - QR_PANEL_WIDTH : w;
+            if (n.x < r) { n.x = r; n.wanderVx = Math.abs(n.wanderVx); }
+            if (n.x > rightWall - r) { n.x = rightWall - r; n.wanderVx = -Math.abs(n.wanderVx); }
+            if (n.y < top + r) { n.y = top + r; n.wanderVy = Math.abs(n.wanderVy); }
+            if (n.y > h - r) { n.y = h - r; n.wanderVy = -Math.abs(n.wanderVy); }
+          });
+        }
+
+        // Team formation: ease each node to its slot inside its team's box,
+        // plus a small idle drift so the final state breathes.
+        if (stateRef.current === 'teams_formed') {
+          nodesRef.current.forEach((n) => {
+            if (!n.teamTarget) return;
+            const ease = Math.min(1, 3.2 * dt);
+            n.x += (n.teamTarget.x - n.x) * ease;
+            n.y += (n.teamTarget.y - n.y) * ease;
+            if (n.driftPhase === undefined) n.driftPhase = Math.random() * Math.PI * 2;
+            n.x += Math.sin(ts / 1400 + n.driftPhase) * 0.16;
+            n.y += Math.cos(ts / 1600 + n.driftPhase) * 0.16;
+          });
+        }
+
+        const grad = ctx.createRadialGradient(w / 2, h * 0.35, 0, w / 2, h * 0.35, Math.max(w, h) * 0.85);
+        grad.addColorStop(0, '#1a1410'); grad.addColorStop(0.6, '#111016'); grad.addColorStop(1, '#07080b');
+        ctx.fillStyle = grad; ctx.fillRect(0, 0, w, h);
+
+        starsRef.current.forEach((s) => {
+          const tw = 0.35 + 0.65 * Math.abs(Math.sin(ts / 1000 * s.sp + s.tw));
+          ctx.beginPath(); ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2); ctx.fillStyle = `rgba(245,240,232,${0.12 * tw})`; ctx.fill();
+        });
+
+        if (stateRef.current === 'teams_formed') {
+          drawTeamBlocks(w, h, now);
+        } else {
+          const byId = new Map(nodesRef.current.map((n) => [n.id, n]));
+          persistentEdgesRef.current.forEach(({ a, b, w: shared }) => {
+            const na = byId.get(a), nb = byId.get(b);
+            if (!na || !nb) return;
+            const alpha = 0.05 + (shared - 3) * 0.035;
+            ctx.strokeStyle = `rgba(232,185,35,${alpha})`; ctx.lineWidth = 0.8;
+            const mx = (na.x + nb.x) / 2, my = (na.y + nb.y) / 2, dx = nb.x - na.x, dy = nb.y - na.y;
+            ctx.beginPath(); ctx.moveTo(na.x, na.y); ctx.quadraticCurveTo(mx - dy * 0.08, my + dx * 0.08, nb.x, nb.y); ctx.stroke();
+          });
+
+          flashEdgesRef.current = flashEdgesRef.current.filter((e) => now - e.bornAt < 1500);
+          flashEdgesRef.current.forEach(({ a, b, bornAt }) => {
+            const na = byId.get(a), nb = byId.get(b);
+            if (!na || !nb) return;
+            const age = (now - bornAt) / 1500, fade = 1 - age;
+            ctx.strokeStyle = `rgba(255,180,80,${fade * 0.85})`; ctx.lineWidth = 1.6 + fade * 1.4;
+            ctx.shadowColor = 'rgba(255,150,60,0.8)'; ctx.shadowBlur = 8 * fade;
+            ctx.beginPath(); ctx.moveTo(na.x, na.y); ctx.lineTo(nb.x, nb.y); ctx.stroke(); ctx.shadowBlur = 0;
+          });
+
+          nodesRef.current.forEach((n) => {
+            const pulsing = now < n.pulseUntil;
+            const pulseAmt = pulsing ? 1 + 0.9 * ((n.pulseUntil - now) / 900) : 1;
+            const entry = Math.max(0.01, Math.min(1, (now - n.bornAt) / 600));
+            const r = n.radius * pulseAmt * entry;
+            const halo = ctx.createRadialGradient(n.x, n.y, 0, n.x, n.y, r * 4.5);
+            halo.addColorStop(0, n.colour + '55'); halo.addColorStop(1, 'transparent');
+            ctx.fillStyle = halo; ctx.beginPath(); ctx.arc(n.x, n.y, r * 4.5, 0, Math.PI * 2); ctx.fill();
+            ctx.beginPath(); ctx.arc(n.x, n.y, r, 0, Math.PI * 2);
+            ctx.shadowColor = n.colour; ctx.shadowBlur = pulsing ? 26 : 13; ctx.fillStyle = n.colour; ctx.fill(); ctx.shadowBlur = 0;
+            ctx.beginPath(); ctx.arc(n.x - r * 0.28, n.y - r * 0.28, r * 0.35, 0, Math.PI * 2);
+            ctx.fillStyle = 'rgba(255,255,255,0.55)'; ctx.fill();
+            ctx.font = "500 11.5px Inter, system-ui, sans-serif"; ctx.fillStyle = `rgba(245,240,232,${0.55 * entry})`;
+            ctx.textAlign = 'left';
+            ctx.fillText(n.name || '', n.x + r + 6, n.y + 4);
+          });
+        }
+      } catch (e) {
+        ctx.shadowBlur = 0;
+      }
+    }
+    rafRef.current = requestAnimationFrame(draw);
+    return () => { window.removeEventListener('resize', resize); cancelAnimationFrame(rafRef.current); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
-    const onConnect = () => auth(store.get(PIN_KEY), false);
-    const onState = (s) => setSt(s);
-    socket.on('connect', onConnect);
-    socket.on('state', onState);
-    if (socket.connected) onConnect();
-    return () => {
-      socket.off('connect', onConnect);
-      socket.off('state', onState);
+    function syncNodes(participants) {
+      const ids = new Set(Object.keys(participants));
+      Object.values(participants).forEach((p) => ensureNode(p.id, p.name));
+      nodesRef.current = nodesRef.current.filter((n) => ids.has(n.id));
+    }
+
+    const onState = (state) => {
+      setJoinedCount(Object.keys(state.participants).length);
+      setSessionState(state.session.state);
+      setTeams(state.teams);
+      setSubmittedCount(state.submitted || 0);
+      syncNodes(state.participants);
+      nodesRef.current.forEach((n) => { n.answerVector = {}; });
+      state.answers.forEach((a) => {
+        const node = nodesRef.current.find((n) => n.id === a.participantId);
+        if (node) node.answerVector[a.questionIndex] = a.optionIndex;
+      });
+      recomputePersistentEdges();
+      if (state.session.state === 'teams_formed') {
+        stateRef.current = 'teams_formed';
+        applyTeamPositions(state.teams);
+        setQrOpen(false);
+      } else {
+        stateRef.current = state.session.state;
+        clearTeamLook();
+      }
     };
-  }, [auth]);
 
-  useEffect(() => () => clearTimeout(toastTimer.current), []);
+    const onParticipants = (participants) => {
+      setJoinedCount(Object.keys(participants).length);
+      syncNodes(participants);
+      recomputePersistentEdges();
+      setSessionState((s) => (s === 'idle' ? 'populating' : s));
+    };
 
-  const setTeams = (v) => {
-    const parsed = parseInt(v, 10);
-    const n = clamp(Number.isFinite(parsed) ? parsed : count, MIN_TEAMS, MAX_TEAMS);
-    setCount(n);
-    setCountText(String(n));
-    if (authed) socket.emit('facilitator:setTeamCount', { count: n });
-  };
+    const onAnswer = (answer) => {
+      const node = nodesRef.current.find((n) => n.id === answer.participantId);
+      if (node) { node.answerVector[answer.questionIndex] = answer.optionIndex; node.pulseUntil = Date.now() + 900; }
+      recomputePersistentEdges();
+      const peers = nodesRef.current.filter((n) => n.id !== answer.participantId && n.answerVector[answer.questionIndex] === answer.optionIndex);
+      shuffleArr(peers).slice(0, 3).forEach((p) => flashEdgesRef.current.push({ a: answer.participantId, b: p.id, bornAt: Date.now() }));
+    };
 
-  const participants = st ? st.participants : [];
-  const total = participants.length;
-  const women = participants.filter((p) => p.gender === 'female').length;
-  const doneCount = st ? st.doneCount || 0 : 0;
-  const questionCount = st ? st.questionCount || 0 : 0;
-  const quizStarted = !!(st && st.quizStarted);
-  const effective = total >= 2 ? Math.min(count, total) : count;
-  const formed = !!(st && st.formed);
+    const onSubmitted = ({ submitted }) => setSubmittedCount(submitted);
 
-  const startQuiz = () => {
-    socket.timeout(10000).emit('facilitator:startQuiz', {}, (err, res) => {
-      if (err || !res || !res.ok) return showToast('error', 'Could not start the quiz. Try again.');
-      showToast('ok', 'Quiz started');
-    });
-  };
+    const onSession = (session) => {
+      setSessionState((s) => (session.state === 'idle' && s === 'populating' ? s : session.state));
+    };
 
-  const sizeHint = (() => {
-    if (total < 2) return 'Waiting for participants to join';
-    const lo = Math.floor(total / effective);
-    const hi = Math.ceil(total / effective);
-    return lo === hi ? `${lo} people per team` : `${lo} to ${hi} people per team`;
-  })();
+    // First "Make teams": scatter, banner, then everyone flies into their box.
+    // Reshuffle: nodes glide straight to their new boxes, no banner.
+    const onTeamsFormed = ({ teams: list, participants, reshuffled }) => {
+      syncNodes(participants);
+      setTeams(list);
+      setQrOpen(false);
+      if (reshuffled) {
+        stateRef.current = 'teams_formed';
+        setSessionState('teams_formed');
+        applyTeamPositions(list);
+        return;
+      }
+      setSessionState('teams_formed'); setShowFormingBanner(true);
+      nodesRef.current.forEach((n) => {
+        n.teamTarget = null;
+        n.wanderVx = (n.wanderVx || 0) + (Math.random() - 0.5) * 90;
+        n.wanderVy = (n.wanderVy || 0) + (Math.random() - 0.5) * 90;
+      });
+      setTimeout(() => {
+        stateRef.current = 'teams_formed';
+        applyTeamPositions(teamsRef.current.length ? teamsRef.current : list);
+      }, 1400);
+      setTimeout(() => setShowFormingBanner(false), 4200);
+    };
 
-  const teams = useMemo(() => {
-    if (!st || !st.formed) return [];
-    const arr = Array.from({ length: st.formedTeamCount }, (_, i) => ({ index: i, members: [] }));
-    for (const p of st.participants) if (p.team != null && arr[p.team]) arr[p.team].members.push(p);
-    return arr;
-  }, [st]);
+    // Late joiners, manual moves, removals: update quietly.
+    const onTeamsUpdate = ({ teams: list, participants }) => {
+      syncNodes(participants);
+      setTeams(list);
+      stateRef.current = 'teams_formed';
+      setSessionState('teams_formed');
+      applyTeamPositions(list);
+    };
 
-  const form = () => {
-    if (busy) return;
-    if (total < 2) return showToast('error', 'At least 2 participants are needed.');
-    setBusy(true);
-    const wasFormed = formed;
-    socket.timeout(10000).emit('facilitator:form', { count }, (err, res) => {
-      setBusy(false);
-      if (err) return showToast('error', 'The server did not respond. Try again.');
-      if (!res || !res.ok) return showToast('error', (res && res.error) || 'Could not form teams.');
-      showToast('ok', wasFormed ? 'Teams reshuffled' : `${res.teams} teams created`);
-    });
-  };
+    const onReset = () => {
+      nodesRef.current = []; persistentEdgesRef.current = []; flashEdgesRef.current = [];
+      setTeams([]); setSessionState('idle'); setJoinedCount(0); setSubmittedCount(0);
+      stateRef.current = 'idle';
+      setQrOpen(true);
+    };
 
-  const doReset = () => {
-    setConfirmReset(false);
-    socket.timeout(10000).emit('facilitator:reset', {}, (err, res) => {
-      if (err || !res || !res.ok) return showToast('error', 'Reset failed. Try again.');
-      showToast('ok', 'Session reset');
-    });
-  };
+    const hello = () => socket.emit('hello', { role: 'projector' });
 
-  const dashboardUrl = `${window.location.origin}/?view=dashboard`;
+    socket.on('state_sync', onState);
+    socket.on('participants_update', onParticipants);
+    socket.on('answer_received', onAnswer);
+    socket.on('submitted_update', onSubmitted);
+    socket.on('session_update', onSession);
+    socket.on('teams_formed', onTeamsFormed);
+    socket.on('teams_update', onTeamsUpdate);
+    socket.on('reset', onReset);
+    socket.on('connect', hello);
+    if (socket.connected) hello();
 
-  if (!authed) {
-    return (
-      <div className="screen center">
-        <div className="card join-card">
-          <Brand size={40} />
-          <div className="eyebrow">Facilitator</div>
-          <h1 className="title sm">{APP_NAME}</h1>
-          {needPin ? (
-            <form
-              className="form"
-              onSubmit={(e) => {
-                e.preventDefault();
-                auth(pin.trim(), true);
-              }}
-            >
-              <label className="field">
-                <span>Facilitator PIN</span>
-                <input
-                  type="password"
-                  inputMode="numeric"
-                  value={pin}
-                  onChange={(e) => setPin(e.target.value)}
-                  autoFocus
-                />
-              </label>
-              {pinError && <div className="error">{pinError}</div>}
-              <button className="btn primary block lg" type="submit" disabled={!connected}>
-                <Lock size={18} /> Unlock
-              </button>
-            </form>
-          ) : (
-            <div className="loading-row">
-              <span className="spinner" /> Connecting to server
-            </div>
-          )}
-        </div>
-        <ConnBadge connected={connected} />
-      </div>
-    );
-  }
+    return () => {
+      socket.off('state_sync', onState); socket.off('participants_update', onParticipants);
+      socket.off('answer_received', onAnswer); socket.off('submitted_update', onSubmitted);
+      socket.off('session_update', onSession); socket.off('teams_formed', onTeamsFormed);
+      socket.off('teams_update', onTeamsUpdate); socket.off('reset', onReset); socket.off('connect', hello);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ensureNode]);
 
   return (
-    <div className="fac">
-      <header className="fac-head">
-        <div className="fac-brand">
-          <Brand size={34} />
-          <div>
-            <div className="fac-title">{APP_NAME}</div>
-            <div className="fac-sub">Facilitator</div>
-          </div>
-        </div>
-        <span className={`live ${connected ? '' : 'off'}`}>
-          <i /> {connected ? 'Live' : 'Offline'}
-        </span>
-      </header>
+    <div style={{ position: 'relative', width: '100vw', height: '100vh', overflow: 'hidden', background: '#07080b' }}>
+      <canvas ref={canvasRef} style={{ position: 'absolute', top: 0, left: 0 }} />
+      <QrPanel open={qrOpen} onClose={() => setQrOpen(false)} joinUrl={joinUrl} />
 
-      <section className="stats">
-        <div className="stat">
-          <b>{total}</b>
-          <span>Joined</span>
-        </div>
-        <div className="stat">
-          <b>{women}</b>
-          <span>Women</span>
-        </div>
-        <div className="stat">
-          <b>{quizStarted ? doneCount : '-'}</b>
-          <span>Quiz done</span>
-        </div>
-        <div className="stat">
-          <b>{formed ? st.formedTeamCount : '-'}</b>
-          <span>Teams</span>
-        </div>
-      </section>
-
-      <section className="panel">
-        <div className="panel-title row">
-          <span>Quiz</span>
-          <span className={`count-chip ${quizStarted ? 'live-chip' : ''}`}>
-            {quizStarted ? 'Live' : `${questionCount} questions`}
+      <div className="lc-fadein" style={{
+        position: 'absolute', top: 0, left: 0, right: 0, height: TOP_BAR_HEIGHT, zIndex: 15,
+        display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0 28px',
+        background: '#0d0e12',
+        borderBottom: '2px solid #e8571a',
+        backdropFilter: 'blur(10px)', fontFamily: "'Inter',sans-serif",
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12, flex: 1 }}>
+          <img src="/logo.png" alt="Carnelian" style={{ height: 38 }} />
+          <span style={{ fontFamily: "'Poppins',sans-serif", fontWeight: 700, fontSize: 16, letterSpacing: '.01em', color: '#f5f0e8' }}>
+            {APP_NAME}
           </span>
         </div>
-        {quizStarted ? (
-          <>
-            <div className="progress lg">
-              <i style={{ width: `${total ? (doneCount / total) * 100 : 0}%` }} />
-            </div>
-            <div className="hint">
-              {doneCount} of {total} finished. Late joiners go straight into the quiz.
-            </div>
-          </>
-        ) : (
-          <button className="btn outline block lg" type="button" onClick={startQuiz} disabled={!connected}>
-            <Play size={18} /> Start quiz
-          </button>
-        )}
-      </section>
-
-      <section className="panel">
-        <div className="panel-title">How many teams?</div>
-        <div className="stepper">
-          <button type="button" onClick={() => setTeams(count - 1)} disabled={count <= MIN_TEAMS} aria-label="Fewer teams">
-            <Minus size={22} />
-          </button>
-          <input
-            type="number"
-            inputMode="numeric"
-            min={MIN_TEAMS}
-            max={MAX_TEAMS}
-            value={countText}
-            onChange={(e) => setCountText(e.target.value)}
-            onBlur={() => setTeams(countText)}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') e.currentTarget.blur();
-            }}
-          />
-          <button type="button" onClick={() => setTeams(count + 1)} disabled={count >= MAX_TEAMS} aria-label="More teams">
-            <Plus size={22} />
+        <div style={{ flex: 1, textAlign: 'center', fontFamily: "'Poppins',sans-serif", fontWeight: 700, fontSize: 15 }}>
+          {sessionState === 'quiz_open' ? (
+            <>
+              <span style={{ color: '#e8571a' }}>{submittedCount}</span>
+              <span style={{ color: 'rgba(245,240,232,.55)', marginLeft: 6 }}>submitted</span>
+              <span style={{ color: 'rgba(245,240,232,.25)', margin: '0 10px' }}>|</span>
+              <span style={{ color: '#e8571a' }}>{joinedCount}</span>
+              <span style={{ color: 'rgba(245,240,232,.55)', marginLeft: 6 }}>joined</span>
+            </>
+          ) : sessionState === 'teams_formed' ? (
+            <>
+              <span style={{ color: '#e8571a' }}>{teams.length}</span>
+              <span style={{ color: 'rgba(245,240,232,.55)', marginLeft: 6 }}>teams formed</span>
+            </>
+          ) : (
+            <>
+              <span style={{ color: '#e8571a' }}>{joinedCount}</span>
+              <span style={{ color: 'rgba(245,240,232,.55)', marginLeft: 6 }}>joined</span>
+            </>
+          )}
+        </div>
+        <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 18 }}>
+          <span style={{ fontSize: 11.5, letterSpacing: '.1em', textTransform: 'uppercase', color: 'rgba(245,240,232,.4)' }}>
+            Convey Meaning. Create Significance.
+          </span>
+          <button onClick={() => setQrOpen((o) => !o)} style={{
+            display: 'flex', alignItems: 'center', gap: 8, padding: '8px 14px', borderRadius: 999,
+            border: `1px solid ${qrOpen ? '#e8571a' : 'rgba(255,255,255,.2)'}`,
+            background: qrOpen ? 'rgba(232,87,26,.18)' : 'rgba(255,255,255,.04)',
+            color: '#f5f0e8', fontSize: 13, fontWeight: 600, cursor: 'pointer', whiteSpace: 'nowrap',
+          }}>
+            <QrIcon size={15} /> {qrOpen ? 'Hide QR' : 'QR code'}
           </button>
         </div>
-        <div className="hint">{sizeHint}</div>
-        {total >= 2 && count > total && (
-          <div className="note">Only {total} participants have joined, so {total} teams will be created.</div>
-        )}
-        {women > 0 && total >= 2 && women < effective && (
-          <div className="note">
-            {women} {women === 1 ? 'woman' : 'women'} for {effective} teams. Some teams will not include a woman.
+      </div>
+
+      {showFormingBanner && (
+        <div className="lc-fadein" style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', pointerEvents: 'none', background: 'radial-gradient(circle, rgba(7,8,11,.72) 0%, transparent 65%)' }}>
+          <div style={{ fontSize: 13, letterSpacing: '.3em', textTransform: 'uppercase', color: 'rgba(232,185,35,.8)', marginBottom: 14, fontWeight: 600 }}>Forming</div>
+          <div style={{ fontFamily: "'Poppins',sans-serif", fontWeight: 800, fontSize: 'clamp(44px,7vw,104px)', letterSpacing: '-0.03em', color: '#f5f0e8', textShadow: '0 0 60px rgba(232,87,26,.6)' }}>{NUMBER_WORDS[teams.length] || teams.length} Teams</div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ============================================================
+   FACILITATOR VIEW (mobile friendly)
+   ============================================================ */
+function FacilitatorView() {
+  const connected = useConnection();
+  const [joinedCount, setJoinedCount] = useState(0);
+  const [sessionState, setSessionState] = useState('idle');
+  const [submittedCount, setSubmittedCount] = useState(0);
+  const [questions, setQuestions] = useState([]);
+  const [participants, setParticipants] = useState({});
+  const [teams, setTeams] = useState([]);
+  const [teamCount, setTeamCount] = useState(10);
+  const [teamCountText, setTeamCountText] = useState('10');
+  const [moveParticipantId, setMoveParticipantId] = useState('');
+  const [moveTeamId, setMoveTeamId] = useState('');
+  const [search, setSearch] = useState('');
+  const [confirm, setConfirm] = useState(null);
+  const [notice, setNotice] = useState('');
+  const editingCount = useRef(false);
+  const noticeTimer = useRef(null);
+
+  const flash = useCallback((text) => {
+    setNotice(text);
+    clearTimeout(noticeTimer.current);
+    noticeTimer.current = setTimeout(() => setNotice(''), 2400);
+  }, []);
+
+  useEffect(() => {
+    const syncCount = (n) => {
+      if (editingCount.current || !Number.isFinite(n)) return;
+      setTeamCount(n); setTeamCountText(String(n));
+    };
+    const onState = (state) => {
+      setQuestions(state.questions); setParticipants(state.participants);
+      setJoinedCount(Object.keys(state.participants).length);
+      setSessionState(state.session.state);
+      setTeams(state.teams);
+      setSubmittedCount(state.submitted || 0);
+      syncCount(state.session.teamCount);
+    };
+    const onParticipants = (p) => { setParticipants(p); setJoinedCount(Object.keys(p).length); };
+    const onSubmitted = ({ submitted }) => setSubmittedCount(submitted);
+    const onSession = (session) => { setSessionState(session.state); syncCount(session.teamCount); };
+    const onTeams = ({ teams: list, participants: p }) => { setTeams(list); setParticipants(p); setSessionState('teams_formed'); };
+    const onReset = () => {
+      setSessionState('idle'); setJoinedCount(0); setSubmittedCount(0); setTeams([]); setParticipants({});
+    };
+    const onError = ({ message }) => flash(message);
+    const hello = () => socket.emit('hello', { role: 'facilitator' });
+
+    socket.on('state_sync', onState);
+    socket.on('participants_update', onParticipants);
+    socket.on('submitted_update', onSubmitted);
+    socket.on('session_update', onSession);
+    socket.on('teams_formed', onTeams);
+    socket.on('teams_update', onTeams);
+    socket.on('reset', onReset);
+    socket.on('facilitator_error', onError);
+    socket.on('connect', hello);
+    if (socket.connected) hello();
+    return () => {
+      socket.off('state_sync', onState); socket.off('participants_update', onParticipants);
+      socket.off('submitted_update', onSubmitted); socket.off('session_update', onSession);
+      socket.off('teams_formed', onTeams); socket.off('teams_update', onTeams);
+      socket.off('reset', onReset); socket.off('facilitator_error', onError); socket.off('connect', hello);
+    };
+  }, [flash]);
+
+  useEffect(() => () => clearTimeout(noticeTimer.current), []);
+
+  function commitTeamCount(v) {
+    const parsed = parseInt(v, 10);
+    const n = Math.min(MAX_TEAMS, Math.max(MIN_TEAMS, Number.isFinite(parsed) ? parsed : teamCount));
+    setTeamCount(n); setTeamCountText(String(n));
+    socket.emit('facilitator_set_team_count', { count: n });
+  }
+
+  function startQuiz() { socket.emit('facilitator_start_quiz'); }
+  function makeTeams() {
+    socket.emit('facilitator_make_teams', { count: teamCount });
+    if (sessionState === 'teams_formed') flash('Teams reshuffled');
+  }
+  function resetAll() {
+    setConfirm({
+      title: 'Reset the entire session?',
+      message: 'All participants, answers and teams will be cleared. Everyone will be sent back to the join screen.',
+      confirmLabel: 'Reset everything',
+      danger: true,
+      onConfirm: () => socket.emit('facilitator_reset'),
+    });
+  }
+  function moveParticipant() {
+    if (!moveParticipantId || !moveTeamId) return;
+    socket.emit('facilitator_move_participant', { participantId: moveParticipantId, teamId: moveTeamId });
+    setMoveParticipantId(''); setMoveTeamId('');
+  }
+  function deleteParticipant(id) {
+    const person = participants[id];
+    setConfirm({
+      title: 'Remove this person?',
+      message: `${person ? person.name : 'This participant'} will be removed from the room and from any team they were on.`,
+      confirmLabel: 'Remove',
+      danger: true,
+      onConfirm: () => socket.emit('facilitator_delete_participant', { participantId: id }),
+    });
+  }
+
+  const formed = sessionState === 'teams_formed';
+  const pct = joinedCount ? Math.round((submittedCount / joinedCount) * 100) : 0;
+  const filtered = Object.values(participants).filter((p) => p.name.toLowerCase().includes(search.toLowerCase()));
+  const effective = joinedCount >= 2 ? Math.min(teamCount, joinedCount) : teamCount;
+  const perTeam = (() => {
+    if (joinedCount < 2) return 'Waiting for people to join';
+    const lo = Math.floor(joinedCount / effective), hi = Math.ceil(joinedCount / effective);
+    return lo === hi ? `${lo} people per team` : `${lo} to ${hi} people per team`;
+  })();
+  const dashboardUrl = `${window.location.origin}/#projector`;
+
+  return (
+    <div className="lc-root">
+      <div className="lc-glow" />
+      <ConnectionPill />
+      <div className="lc-content lc-fadein" style={{ padding: '26px clamp(16px,4vw,44px) 60px', maxWidth: 1040, margin: '0 auto' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 15, marginBottom: 26, flexWrap: 'wrap', paddingRight: 90 }}>
+          <img src="/logo.png" alt="Carnelian" style={{ height: 42 }} />
+          <div>
+            <h1 className="lc-h1" style={{ fontSize: 'clamp(19px,3vw,25px)', marginBottom: 6 }}>Facilitator Console</h1>
+            <span className="lc-badge">{sessionState.replace('_', ' ')}</span>
+          </div>
+        </div>
+
+        <div className="lc-stats-row" style={{ display: 'flex', gap: 14, marginBottom: 22, flexWrap: 'wrap' }}>
+          <div className="lc-stat-card"><div className="lc-stat-label">Joined</div><div className="lc-stat-value">{joinedCount}</div></div>
+          <div className="lc-stat-card">
+            <div className="lc-stat-label">Submitted the quiz</div>
+            <div className="lc-stat-value" style={{ color: pct >= 80 ? '#3ddc84' : 'var(--ink)' }}>{submittedCount}<span style={{ color: 'var(--ink-faint)', fontSize: 20 }}>/{joinedCount}</span></div>
+            <div className="lc-bar-track" style={{ marginTop: 10 }}><div className="lc-bar-fill" style={{ width: `${pct}%` }} /></div>
+          </div>
+          <div className="lc-stat-card">
+            <div className="lc-stat-label">Teams</div>
+            <div className="lc-stat-value">{formed ? teams.length : '-'}</div>
+          </div>
+        </div>
+
+        <div className="lc-card" style={{ padding: 24, marginBottom: 18 }}>
+          {sessionState === 'idle' && (
+            <>
+              <p style={{ margin: '0 0 18px', fontSize: 16, color: 'var(--ink-dim)' }}>
+                Once you start, every joined phone gets all {questions.length || 8} questions at once, people answer at their own pace.
+              </p>
+              <button className="lc-btn lc-btn-primary" onClick={startQuiz} disabled={!connected} style={{ width: '100%' }}>Start the quiz</button>
+            </>
+          )}
+          {sessionState === 'quiz_open' && (
+            <>
+              <p style={{ margin: '0 0 8px', fontSize: 16, fontWeight: 500 }}>Quiz is open</p>
+              <p className="lc-faint" style={{ marginTop: 0 }}>People are answering at their own pace. Make teams whenever the room feels ready.</p>
+            </>
+          )}
+          {formed && (
+            <p style={{ margin: 0, fontSize: 16, color: 'var(--ink-dim)' }}>Teams are formed and every phone shows its team. Reshuffle as many times as you like.</p>
+          )}
+        </div>
+
+        <div className="lc-card" style={{ padding: 24, marginBottom: 18 }}>
+          <h3 className="lc-section-title">How many teams?</h3>
+          <div className="lc-stepper">
+            <button type="button" aria-label="Fewer teams" disabled={teamCount <= MIN_TEAMS} onClick={() => commitTeamCount(teamCount - 1)}><Minus size={22} /></button>
+            <input
+              type="number" inputMode="numeric" min={MIN_TEAMS} max={MAX_TEAMS} value={teamCountText}
+              onFocus={() => { editingCount.current = true; }}
+              onChange={(e) => setTeamCountText(e.target.value)}
+              onBlur={() => { editingCount.current = false; commitTeamCount(teamCountText); }}
+              onKeyDown={(e) => { if (e.key === 'Enter') e.currentTarget.blur(); }}
+            />
+            <button type="button" aria-label="More teams" disabled={teamCount >= MAX_TEAMS} onClick={() => commitTeamCount(teamCount + 1)}><Plus size={22} /></button>
+          </div>
+          <p className="lc-faint" style={{ textAlign: 'center' }}>{perTeam}</p>
+          {formed && teamCount !== teams.length && (
+            <p className="lc-faint" style={{ textAlign: 'center', color: 'var(--gold)' }}>Tap Reshuffle to rebuild as {effective} teams.</p>
+          )}
+
+          <div className="lc-btn-row" style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginTop: 18 }}>
+            <button className="lc-btn lc-btn-danger" onClick={makeTeams} disabled={joinedCount < 2 || !connected} style={{ flex: '2 1 220px' }}>
+              {formed ? <><Shuffle size={18} /> Reshuffle teams</> : <><Sparkles size={18} /> Make {effective} teams</>}
+            </button>
+            <button className="lc-btn lc-btn-outline" onClick={resetAll}><RotateCcw size={16} /> Reset</button>
+          </div>
+          {notice && <p className="lc-fadein" style={{ margin: '14px 0 0', textAlign: 'center', fontSize: 14, color: '#3ddc84' }}>{notice}</p>}
+          <a className="lc-btn lc-btn-outline" href={dashboardUrl} target="_blank" rel="noreferrer" style={{ width: '100%', marginTop: 12, fontSize: 14, padding: '12px 18px' }}>
+            <Monitor size={16} /> Open main screen
+          </a>
+        </div>
+
+        {teams.length > 0 && (
+          <div className="lc-card" style={{ padding: 24, marginBottom: 18 }}>
+            <h3 className="lc-section-title">Teams</h3>
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 22 }}>
+              {teams.map((t) => (
+                <div key={t.id} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 14px', borderRadius: 999, background: 'rgba(255,255,255,.03)', border: `1px solid ${t.colour}44`, fontSize: 13 }}>
+                  <span style={{ width: 9, height: 9, borderRadius: '50%', background: t.colour, boxShadow: `0 0 10px ${t.colour}` }} />Team {t.number}<b style={{ color: t.colour }}>{t.memberIds.length}</b>
+                  <span style={{ color: 'var(--ink-faint)', fontSize: 12 }}>{t.memberIds.filter((id) => participants[id] && participants[id].gender === 'female').length}F</span>
+                </div>
+              ))}
+            </div>
+            <h3 className="lc-section-title" style={{ marginBottom: 12 }}>Manual override</h3>
+            <div className="lc-btn-row" style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
+              <select className="lc-select" value={moveParticipantId} onChange={(e) => setMoveParticipantId(e.target.value)}>
+                <option value="">Select participant</option>
+                {Object.values(participants).map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+              </select>
+              <select className="lc-select" value={moveTeamId} onChange={(e) => setMoveTeamId(e.target.value)}>
+                <option value="">Select team</option>
+                {teams.map((t) => <option key={t.id} value={t.id}>Team {t.number}</option>)}
+              </select>
+              <button className="lc-btn lc-btn-primary" onClick={moveParticipant}>Move</button>
+            </div>
           </div>
         )}
-        {formed && count !== st.formedTeamCount && (
-          <div className="note accent">Tap Reshuffle to rebuild as {effective} teams.</div>
-        )}
-      </section>
 
-      <section className="panel">
-        <div className="panel-title row">
-          <span>{formed ? 'Teams' : 'Joined so far'}</span>
-          <span className="count-chip">{formed ? `${teams.length} teams` : `${total} people`}</span>
-        </div>
-        {formed ? (
-          <div className="team-list">
-            {teams.map((t) => {
-              const tw = t.members.filter((m) => m.gender === 'female').length;
+        <div className="lc-card" style={{ padding: 24 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, marginBottom: 14, flexWrap: 'wrap' }}>
+            <h3 className="lc-section-title" style={{ margin: 0 }}>Participants ({joinedCount})</h3>
+            <input className="lc-input lc-search" value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search name" style={{ width: 200, padding: '10px 14px', fontSize: 14, textAlign: 'left' }} />
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6, maxHeight: 340, overflowY: 'auto' }}>
+            {filtered.length === 0 && <p className="lc-faint" style={{ margin: 0 }}>Nobody yet.</p>}
+            {filtered.map((p) => {
+              const t = teams.find((tt) => tt.id === p.teamId);
               return (
-                <div className="team-item" key={t.index} style={{ '--team': teamColor(t.index) }}>
-                  <div className="team-item-head">
-                    <span className="dot" />
-                    <b>Team {t.index + 1}</b>
-                    <span className="team-item-meta">
-                      {t.members.length} members, {tw} {tw === 1 ? 'woman' : 'women'}
-                    </span>
-                  </div>
-                  <div className="chips">
-                    {t.members.map((m) => (
-                      <span className="chip" key={m.id}>
-                        {m.name}
-                      </span>
-                    ))}
-                  </div>
+                <div key={p.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10, background: 'rgba(255,255,255,.03)', padding: '10px 15px', borderRadius: 10, fontSize: 14 }}>
+                  <span style={{ display: 'flex', alignItems: 'center', gap: 9, minWidth: 0 }}>
+                    {t && <span style={{ width: 8, height: 8, borderRadius: '50%', background: t.colour, flex: '0 0 8px' }} />}
+                    <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{p.name}</span>
+                    {t && <span style={{ color: 'var(--ink-faint)', fontSize: 12, whiteSpace: 'nowrap' }}>Team {t.number}</span>}
+                  </span>
+                  <button onClick={() => deleteParticipant(p.id)} style={{ padding: '5px 12px', borderRadius: 8, border: 'none', background: 'rgba(168,50,50,.2)', color: '#ff9a9a', fontSize: 12, cursor: 'pointer', flex: '0 0 auto' }}>Remove</button>
                 </div>
               );
             })}
           </div>
-        ) : total === 0 ? (
-          <div className="empty">
-            <QrCode size={22} />
-            <span>Open the main screen. Participants join by scanning its QR code.</span>
-          </div>
-        ) : (
-          <div className="chips scroll">
-            {participants
-              .slice()
-              .reverse()
-              .map((p) => (
-                <span className="chip" key={p.id}>
-                  {p.name}
-                </span>
-              ))}
-          </div>
-        )}
-      </section>
-
-      <section className="panel quiet">
-        <a className="btn ghost block" href={dashboardUrl} target="_blank" rel="noreferrer">
-          <Monitor size={18} /> Open main screen
-        </a>
-        <button className="btn danger block" type="button" onClick={() => setConfirmReset(true)}>
-          <RotateCcw size={18} /> Reset session
-        </button>
-      </section>
-
-      <div className="action-bar">
-        <button className="btn primary block lg" type="button" onClick={form} disabled={busy || total < 2 || !connected}>
-          {busy ? (
-            <span className="spinner" />
-          ) : formed ? (
-            <>
-              <Shuffle size={20} /> Reshuffle teams
-            </>
-          ) : (
-            <>
-              <Sparkles size={20} /> {total >= 2 ? `Create ${effective} teams` : 'Create teams'}
-            </>
-          )}
-        </button>
+        </div>
       </div>
 
-      {toast && (
-        <div className={`toast ${toast.type}`}>
-          {toast.type === 'ok' ? <Sparkles size={16} /> : <X size={16} />} {toast.text}
-        </div>
-      )}
-
-      {confirmReset && (
-        <div className="modal" onClick={() => setConfirmReset(false)}>
-          <div className="modal-card" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-icon">
-              <RotateCcw size={22} />
-            </div>
-            <h3>Reset the session?</h3>
-            <p className="muted">
-              This removes all {total} participants and every team. Everyone is sent back to the join screen.
-            </p>
-            <div className="modal-actions">
-              <button className="btn ghost" type="button" onClick={() => setConfirmReset(false)}>
-                Cancel
-              </button>
-              <button className="btn danger solid" type="button" onClick={doReset}>
-                Reset
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+      <ConfirmModal
+        open={!!confirm}
+        title={confirm?.title}
+        message={confirm?.message}
+        confirmLabel={confirm?.confirmLabel}
+        danger={confirm?.danger}
+        onCancel={() => setConfirm(null)}
+        onConfirm={() => { confirm?.onConfirm?.(); setConfirm(null); }}
+      />
     </div>
   );
 }
 
-/* =========================================================
-   Dashboard engine (canvas + d3-force)
-   ========================================================= */
-
-function createEngine(canvas, container) {
-  const ctx = canvas.getContext('2d');
-  const nodes = [];
-  const byId = new Map();
-  let W = 1;
-  let H = 1;
-  let dpr = 1;
-  let formed = false;
-  let teamCount = 0;
-  let cells = [];
-  let teams = [];
-  let radius = 12;
-  let labelSize = 12;
-  let first = true;
-  let raf = 0;
-
-  const PAD_X = 40;
-  const TOP = 132;
-  const BOTTOM = 40;
-  const CELL_HEAD = 34;
-
-  const stars = Array.from({ length: 150 }, () => ({
-    x: Math.random(),
-    y: Math.random(),
-    r: Math.random() * 1.2 + 0.3,
-    p: Math.random() * TAU,
-    s: 0.4 + Math.random() * 1.2,
-  }));
-
-  const area = () => ({
-    x: PAD_X,
-    y: TOP,
-    w: Math.max(120, W - PAD_X * 2),
-    h: Math.max(120, H - TOP - BOTTOM),
-  });
-
-  const cellOf = (n) => (formed && n.team != null ? cells[n.team] : null);
-
-  function wander() {
-    const s = formed ? 0.035 : 0.2;
-    for (const n of nodes) {
-      n.theta += (Math.random() - 0.5) * 0.3;
-      n.vx += Math.cos(n.theta) * s;
-      n.vy += Math.sin(n.theta) * s;
-    }
-  }
-
-  function bounds() {
-    const a = area();
-    for (const n of nodes) {
-      const c = cellOf(n);
-      let x0;
-      let x1;
-      let y0;
-      let y1;
-      if (c) {
-        x0 = c.x + radius + 10;
-        x1 = c.x + c.w - radius - 10;
-        y0 = c.y + CELL_HEAD + radius;
-        y1 = c.y + c.h - radius - 10;
-      } else {
-        x0 = a.x + radius;
-        x1 = a.x + a.w - radius;
-        y0 = a.y + radius;
-        y1 = a.y + a.h - radius;
-      }
-      if (x1 < x0) x0 = x1 = (x0 + x1) / 2;
-      if (y1 < y0) y0 = y1 = (y0 + y1) / 2;
-      const k = c ? 0.04 : 0.12;
-      const cap = c ? 0.6 : 2;
-      if (n.x < x0) {
-        n.vx += Math.min((x0 - n.x) * k, cap);
-        if (!c) n.theta = rand(-0.8, 0.8);
-      } else if (n.x > x1) {
-        n.vx -= Math.min((n.x - x1) * k, cap);
-        if (!c) n.theta = Math.PI + rand(-0.8, 0.8);
-      }
-      if (n.y < y0) {
-        n.vy += Math.min((y0 - n.y) * k, cap);
-        if (!c) n.theta = Math.PI / 2 + rand(-0.8, 0.8);
-      } else if (n.y > y1) {
-        n.vy -= Math.min((n.y - y1) * k, cap);
-        if (!c) n.theta = -Math.PI / 2 + rand(-0.8, 0.8);
-      }
-    }
-  }
-
-  const sim = forceSimulation(nodes)
-    .alpha(0.3)
-    .alphaDecay(0)
-    .velocityDecay(0.22)
-    .force('charge', forceManyBody().strength(-8).distanceMax(120))
-    .force('collide', forceCollide().radius(() => radius + 6).strength(0.8).iterations(2))
-    .force('x', forceX())
-    .force('y', forceY())
-    .force('wander', wander)
-    .force('bounds', bounds)
-    .stop();
-
-  function applyForces() {
-    sim
-      .force('x')
-      .x((n) => (cellOf(n) ? cellOf(n).cx : n.x))
-      .strength((n) => (cellOf(n) ? 0.055 : 0));
-    sim
-      .force('y')
-      .y((n) => (cellOf(n) ? cellOf(n).cy : n.y))
-      .strength((n) => (cellOf(n) ? 0.055 : 0));
-    sim.force('collide').radius(() => radius + (formed ? 4 : 6));
-    sim.force('charge').strength(formed ? -14 : -8);
-    sim.velocityDecay(formed ? 0.3 : 0.22);
-  }
-
-  function layout() {
-    const a = area();
-    const N = Math.max(1, nodes.length);
-    radius = clamp(Math.sqrt((a.w * a.h) / N) * 0.1, 5, 15);
-    cells = [];
-    if (formed && teamCount > 0) {
-      let best = null;
-      for (let cols = 1; cols <= teamCount; cols++) {
-        const rows = Math.ceil(teamCount / cols);
-        const cw = a.w / cols;
-        const ch = a.h / rows;
-        const score = Math.min(cw / 1.35, ch);
-        if (!best || score > best.score) best = { cols, rows, cw, ch, score };
-      }
-      const { cols, rows, cw, ch } = best;
-      const gap = clamp(Math.min(cw, ch) * 0.06, 8, 22);
-      for (let i = 0; i < teamCount; i++) {
-        const row = Math.floor(i / cols);
-        const col = i % cols;
-        const inRow = row === rows - 1 ? teamCount - row * cols : cols;
-        const off = ((cols - inRow) * cw) / 2;
-        const x = a.x + off + col * cw + gap / 2;
-        const y = a.y + row * ch + gap / 2;
-        const w = cw - gap;
-        const h = ch - gap;
-        cells.push({ x, y, w, h, cx: x + w / 2, cy: y + CELL_HEAD + (h - CELL_HEAD) / 2 });
-      }
-      const maxTeam = Math.max(1, ...teams.map((t) => t.length));
-      const c0 = cells[0];
-      const per = Math.sqrt((c0.w * Math.max(20, c0.h - CELL_HEAD)) / maxTeam);
-      radius = clamp(Math.min(radius, per * 0.17), 4, 15);
-    }
-    labelSize = clamp(radius * 1.05, 9, 15);
-  }
-
-  function resize() {
-    const r = container.getBoundingClientRect();
-    W = Math.max(1, r.width);
-    H = Math.max(1, r.height);
-    dpr = Math.min(window.devicePixelRatio || 1, 2);
-    canvas.width = Math.round(W * dpr);
-    canvas.height = Math.round(H * dpr);
-    canvas.style.width = `${W}px`;
-    canvas.style.height = `${H}px`;
-    layout();
-    applyForces();
-  }
-
-  function update(st) {
-    const now = performance.now();
-    const seen = new Set();
-    const a = area();
-    for (const p of st.participants) {
-      seen.add(p.id);
-      let n = byId.get(p.id);
-      if (!n) {
-        n = {
-          id: p.id,
-          x: a.x + Math.random() * a.w,
-          y: a.y + Math.random() * a.h,
-          vx: 0,
-          vy: 0,
-          theta: Math.random() * TAU,
-          born: first ? now - 5000 : now,
-        };
-        byId.set(p.id, n);
-        nodes.push(n);
-      }
-      n.name = p.name;
-      n.label = shortLabel(p.name);
-      n.team = p.team;
-      n.done = !!p.done;
-    }
-    for (let i = nodes.length - 1; i >= 0; i--) {
-      if (!seen.has(nodes[i].id)) {
-        byId.delete(nodes[i].id);
-        nodes.splice(i, 1);
-      }
-    }
-    formed = !!st.formed && st.formedTeamCount > 0;
-    teamCount = formed ? st.formedTeamCount : 0;
-    teams = Array.from({ length: teamCount }, () => []);
-    if (formed) for (const n of nodes) if (n.team != null && teams[n.team]) teams[n.team].push(n);
-    layout();
-    sim.nodes(nodes);
-    applyForces();
-    first = false;
-  }
-
-  function roundRect(x, y, w, h, r) {
-    const rr = Math.min(r, w / 2, h / 2);
-    ctx.beginPath();
-    ctx.moveTo(x + rr, y);
-    ctx.arcTo(x + w, y, x + w, y + h, rr);
-    ctx.arcTo(x + w, y + h, x, y + h, rr);
-    ctx.arcTo(x, y + h, x, y, rr);
-    ctx.arcTo(x, y, x + w, y, rr);
-    ctx.closePath();
-  }
-
-  const easeOutBack = (x) => {
-    const c1 = 1.70158;
-    const c3 = c1 + 1;
-    return 1 + c3 * Math.pow(x - 1, 3) + c1 * Math.pow(x - 1, 2);
-  };
-
-  function draw(t) {
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.clearRect(0, 0, W, H);
-
-    // stars
-    ctx.fillStyle = '#CFD8FF';
-    for (const s of stars) {
-      ctx.globalAlpha = 0.12 + 0.3 * (0.5 + 0.5 * Math.sin(t * 0.001 * s.s + s.p));
-      ctx.beginPath();
-      ctx.arc(s.x * W, s.y * H, s.r, 0, TAU);
-      ctx.fill();
-    }
-    ctx.globalAlpha = 1;
-
-    // team blocks
-    if (formed) {
-      cells.forEach((c, i) => {
-        const col = teamColor(i);
-        const fs = clamp(Math.min(c.w, c.h) * 0.085, 12, 18);
-        ctx.globalAlpha = 0.07;
-        ctx.fillStyle = col;
-        roundRect(c.x, c.y, c.w, c.h, 16);
-        ctx.fill();
-        ctx.globalAlpha = 0.5;
-        ctx.strokeStyle = col;
-        ctx.lineWidth = 1.5;
-        roundRect(c.x, c.y, c.w, c.h, 16);
-        ctx.stroke();
-        ctx.globalAlpha = 1;
-        ctx.textBaseline = 'middle';
-        ctx.textAlign = 'left';
-        ctx.fillStyle = col;
-        ctx.font = `600 ${fs}px "Space Grotesk", Inter, sans-serif`;
-        ctx.fillText(`Team ${i + 1}`, c.x + 14, c.y + CELL_HEAD / 2 + 2);
-        ctx.textAlign = 'right';
-        ctx.globalAlpha = 0.65;
-        ctx.fillStyle = '#E8ECF6';
-        ctx.font = `500 ${fs - 2}px Inter, sans-serif`;
-        ctx.fillText(`${teams[i] ? teams[i].length : 0}`, c.x + c.w - 14, c.y + CELL_HEAD / 2 + 2);
-      });
-      ctx.globalAlpha = 1;
-    }
-
-    // links
-    ctx.lineWidth = 1;
-    if (formed) {
-      for (let ti = 0; ti < teams.length; ti++) {
-        const m = teams[ti];
-        const c = cells[ti];
-        if (!c) continue;
-        const diag = Math.hypot(c.w, c.h);
-        ctx.strokeStyle = teamColor(ti);
-        for (let i = 0; i < m.length; i++) {
-          for (let j = i + 1; j < m.length; j++) {
-            const a = m[i];
-            const b = m[j];
-            const d = Math.hypot(a.x - b.x, a.y - b.y);
-            if (m.length > 14 && d > radius * 9) continue;
-            ctx.globalAlpha = 0.34 * clamp(1 - d / (diag * 1.4), 0.1, 1);
-            ctx.beginPath();
-            ctx.moveTo(a.x, a.y);
-            ctx.lineTo(b.x, b.y);
-            ctx.stroke();
-          }
-        }
-      }
-    } else {
-      const D = radius * 11;
-      const D2 = D * D;
-      ctx.strokeStyle = NODE_COLOR;
-      for (let i = 0; i < nodes.length; i++) {
-        const a = nodes[i];
-        for (let j = i + 1; j < nodes.length; j++) {
-          const b = nodes[j];
-          const dx = a.x - b.x;
-          if (dx > D || dx < -D) continue;
-          const dy = a.y - b.y;
-          const d2 = dx * dx + dy * dy;
-          if (d2 > D2) continue;
-          ctx.globalAlpha = (1 - Math.sqrt(d2) / D) * 0.38;
-          ctx.beginPath();
-          ctx.moveTo(a.x, a.y);
-          ctx.lineTo(b.x, b.y);
-          ctx.stroke();
-        }
-      }
-    }
-    ctx.globalAlpha = 1;
-
-    // nodes
-    for (const n of nodes) {
-      const col = cellOf(n) ? teamColor(n.team) : NODE_COLOR;
-      const age = t - n.born;
-      const grow = age < 650 ? easeOutBack(clamp(age / 650, 0, 1)) : 1;
-      const r = Math.max(0.5, radius * grow);
-
-      if (age > 0 && age < 1700) {
-        const p = clamp(age / 1700, 0, 1);
-        ctx.globalAlpha = (1 - p) * 0.7;
-        ctx.strokeStyle = col;
-        ctx.lineWidth = 2;
-        ctx.beginPath();
-        ctx.arc(n.x, n.y, radius + p * radius * 6, 0, TAU);
-        ctx.stroke();
-      }
-
-      ctx.fillStyle = col;
-      ctx.globalAlpha = 0.16;
-      ctx.beginPath();
-      ctx.arc(n.x, n.y, r * 2.3, 0, TAU);
-      ctx.fill();
-      ctx.globalAlpha = 1;
-      ctx.beginPath();
-      ctx.arc(n.x, n.y, r, 0, TAU);
-      ctx.fill();
-      if (n.done && !cellOf(n)) {
-        ctx.globalAlpha = 0.9;
-        ctx.strokeStyle = '#7BD389';
-        ctx.lineWidth = 1.6;
-        ctx.beginPath();
-        ctx.arc(n.x, n.y, r + 3.5, 0, TAU);
-        ctx.stroke();
-      }
-      ctx.globalAlpha = 0.85;
-      ctx.fillStyle = '#FFFFFF';
-      ctx.beginPath();
-      ctx.arc(n.x - r * 0.3, n.y - r * 0.3, r * 0.28, 0, TAU);
-      ctx.fill();
-    }
-
-    // labels
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.lineJoin = 'round';
-    for (const n of nodes) {
-      const age = t - n.born;
-      const fresh = age < 3000;
-      const fs = fresh ? labelSize * 1.2 : labelSize;
-      ctx.font = `${fresh ? 700 : 500} ${fs}px Inter, sans-serif`;
-      const y = n.y + radius + fs * 0.95;
-      ctx.globalAlpha = 0.9;
-      ctx.lineWidth = 3;
-      ctx.strokeStyle = 'rgba(7,10,20,0.85)';
-      ctx.strokeText(n.label, n.x, y);
-      ctx.globalAlpha = fresh ? 1 : 0.86;
-      ctx.fillStyle = '#EEF1F8';
-      ctx.fillText(n.label, n.x, y);
-    }
-    ctx.globalAlpha = 1;
-  }
-
-  function frame(t) {
-    raf = requestAnimationFrame(frame); // schedule first so one bad frame never stops the screen
-    try {
-      sim.tick();
-      for (const n of nodes) {
-        n.x = clamp(n.x, 0, W);
-        n.y = clamp(n.y, 0, H);
-      }
-      draw(t);
-    } catch (err) {
-      ctx.globalAlpha = 1;
-    }
-  }
-
-  const ro = new ResizeObserver(resize);
-  ro.observe(container);
-  resize();
-  raf = requestAnimationFrame(frame);
-
-  return {
-    update,
-    destroy() {
-      cancelAnimationFrame(raf);
-      ro.disconnect();
-      sim.stop();
-    },
-  };
-}
-
-/* =========================================================
-   Dashboard
-   ========================================================= */
-
-function Dashboard() {
-  const connected = useConnection();
-  const [st, setSt] = useState(null);
-  const [qrOpen, setQrOpen] = useState(true);
-  const [full, setFull] = useState(false);
-  const stageRef = useRef(null);
-  const canvasRef = useRef(null);
-  const engineRef = useRef(null);
-  const latest = useRef(null);
-
-  useEffect(() => {
-    const eng = createEngine(canvasRef.current, stageRef.current);
-    engineRef.current = eng;
-    if (latest.current) eng.update(latest.current);
-    return () => {
-      eng.destroy();
-      engineRef.current = null;
-    };
-  }, []);
-
-  useEffect(() => {
-    const sub = () =>
-      socket.emit('dashboard:subscribe', (s) => {
-        if (s) setSt(s);
-      });
-    const onState = (s) => setSt(s);
-    socket.on('connect', sub);
-    socket.on('state', onState);
-    if (socket.connected) sub();
-    return () => {
-      socket.off('connect', sub);
-      socket.off('state', onState);
-    };
-  }, []);
-
-  useEffect(() => {
-    if (!st) return;
-    latest.current = st;
-    if (engineRef.current) engineRef.current.update(st);
-  }, [st]);
-
-  useEffect(() => {
-    const onKey = (e) => {
-      if (e.target && /input|textarea/i.test(e.target.tagName)) return;
-      if (e.key === 'q' || e.key === 'Q') setQrOpen((o) => !o);
-      if (e.key === 'f' || e.key === 'F') toggleFullscreen();
-    };
-    const onFs = () => setFull(!!document.fullscreenElement);
-    window.addEventListener('keydown', onKey);
-    document.addEventListener('fullscreenchange', onFs);
-    return () => {
-      window.removeEventListener('keydown', onKey);
-      document.removeEventListener('fullscreenchange', onFs);
-    };
-  }, []);
-
-  const total = st ? st.total : 0;
-  const formed = !!(st && st.formed);
-  const quizLive = !!(st && st.quizStarted) && !formed;
-  const subtitle = formed
-    ? `${st.formedTeamCount} teams formed from ${total} participants`
-    : quizLive
-    ? 'Answer the questions on your phone. A green ring means you are done.'
-    : 'Scan the QR code to join the formation';
-
-  return (
-    <div className="dash">
-      <div className="dash-stage" ref={stageRef}>
-        <canvas ref={canvasRef} className="dash-canvas" />
-        <div className="dash-head">
-          <Brand size={46} />
-          <div>
-            <h1>{APP_NAME}</h1>
-            <p>{subtitle}</p>
-          </div>
-        </div>
-        <div className="dash-tools">
-          <div className="live-count">
-            <span className="pulse-dot" />
-            <b>{total}</b> joined
-          </div>
-          {quizLive && (
-            <div className="live-count">
-              <ListChecks size={18} />
-              <b>{st.doneCount}</b> done
-            </div>
-          )}
-          {!qrOpen && (
-            <button className="tool-btn" type="button" onClick={() => setQrOpen(true)}>
-              <QrCode size={18} /> Show QR
-            </button>
-          )}
-          <button className="tool-btn icon" type="button" onClick={toggleFullscreen} aria-label="Toggle fullscreen">
-            {full ? <Minimize2 size={18} /> : <Maximize2 size={18} />}
-          </button>
-        </div>
-        {!connected && (
-          <div className="dash-conn">
-            <WifiOff size={16} /> Reconnecting to server
-          </div>
-        )}
-      </div>
-
-      <aside className={`qr-panel ${qrOpen ? 'open' : ''}`} aria-hidden={!qrOpen}>
-        <div className="qr-inner">
-          <button className="qr-close" type="button" onClick={() => setQrOpen(false)} aria-label="Hide QR code">
-            <ChevronRight size={20} />
-          </button>
-          <div className="eyebrow">Join live</div>
-          <h2>Scan to enter the formation</h2>
-          <div className="qr-box">
-            <QRCodeSVG value={JOIN_URL} size={240} level="M" bgColor="#FFFFFF" fgColor="#0B1020" />
-          </div>
-          <div className="qr-url">{JOIN_URL.replace(/^https?:\/\//, '').replace(/\/$/, '')}</div>
-          <div className="qr-steps">
-            <div>
-              <span>1</span> Open your phone camera
-            </div>
-            <div>
-              <span>2</span> Scan and enter your name
-            </div>
-            <div>
-              <span>3</span> Find your node on screen
-            </div>
-          </div>
-          <div className="qr-count">
-            <span className="pulse-dot" /> <b>{total}</b> {total === 1 ? 'person' : 'people'} in the room
-          </div>
-        </div>
-      </aside>
-    </div>
-  );
-}
-
-/* =========================================================
-   App
-   ========================================================= */
-
+/* ============================================================
+   APP ROOT
+   ============================================================ */
 export default function App() {
-  const view = useMemo(getView, []);
+  useInjectTheme();
   useEffect(() => {
-    document.title =
-      view === 'dashboard' ? `${APP_NAME} | Main Screen` : view === 'facilitator' ? `${APP_NAME} | Facilitator` : APP_NAME;
-  }, [view]);
-
-  return (
-    <>
-      <style>{CSS}</style>
-      {view === 'dashboard' ? <Dashboard /> : view === 'facilitator' ? <Facilitator /> : <Participant />}
-    </>
-  );
+    // Switching between /#projector and /#facilitator in the same tab reloads into that view.
+    const onHash = () => { if (getView() !== VIEW) window.location.reload(); };
+    window.addEventListener('hashchange', onHash);
+    document.title = VIEW === 'projector' ? `${APP_NAME} | Main Screen` : VIEW === 'facilitator' ? `${APP_NAME} | Facilitator` : APP_NAME;
+    return () => window.removeEventListener('hashchange', onHash);
+  }, []);
+  if (VIEW === 'projector') return <ProjectorView />;
+  if (VIEW === 'facilitator') return <FacilitatorView />;
+  return <ParticipantView />;
 }
-
-/* =========================================================
-   Styles
-   ========================================================= */
-
-const CSS = `
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap');
-
-:root{
-  --bg:#070A14;
-  --panel:rgba(255,255,255,0.045);
-  --panel-b:rgba(255,255,255,0.09);
-  --text:#EEF1F8;
-  --muted:#9AA3B8;
-  --accent:#E4572E;
-  --accent2:#F4A27B;
-  --ok:#4ADE80;
-  --danger:#F87171;
-  --team:#E4572E;
-}
-*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-html,body,#root{height:100%;margin:0}
-body{
-  background:
-    radial-gradient(1100px 760px at 12% -10%, #1A1F3D 0%, transparent 60%),
-    radial-gradient(900px 700px at 110% 110%, #2B1220 0%, transparent 55%),
-    var(--bg);
-  color:var(--text);
-  font-family:Inter,system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;
-  -webkit-font-smoothing:antialiased;
-}
-button{font-family:inherit}
-h1,h2,h3{font-family:'Space Grotesk',Inter,sans-serif;margin:0}
-
-/* ---------- generic ---------- */
-.screen{min-height:100%;padding:24px 16px 40px;display:flex;flex-direction:column}
-.screen.center{align-items:center;justify-content:center}
-.card{
-  width:100%;max-width:440px;background:var(--panel);border:1px solid var(--panel-b);
-  border-radius:22px;padding:28px 22px;backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
-  box-shadow:0 30px 80px rgba(0,0,0,0.35);
-  display:flex;flex-direction:column;align-items:center;text-align:center;gap:10px;
-  animation:rise .45s ease both;
-}
-@keyframes rise{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:none}}
-.brand{width:auto;object-fit:contain;display:block}
-.brand-fallback{border-radius:12px;display:grid;place-items:center;background:rgba(228,87,46,0.15);color:var(--accent2)}
-.eyebrow{font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--accent2);font-weight:600;margin-top:6px}
-.title{font-size:30px;line-height:1.1;font-weight:700;letter-spacing:-0.01em}
-.title.sm{font-size:24px}
-.muted{color:var(--muted);margin:0;line-height:1.5;font-size:15px}
-.muted.small{font-size:13px}
-.form{width:100%;display:flex;flex-direction:column;gap:16px;margin-top:12px;text-align:left}
-.field{display:flex;flex-direction:column;gap:8px}
-.field>span{font-size:13px;color:var(--muted);font-weight:500}
-.field input{
-  width:100%;height:52px;border-radius:14px;border:1px solid var(--panel-b);background:rgba(0,0,0,0.25);
-  color:var(--text);padding:0 16px;font-size:16px;outline:none;transition:border-color .2s, box-shadow .2s;
-}
-.field input:focus{border-color:var(--accent2);box-shadow:0 0 0 4px rgba(244,162,123,0.15)}
-.seg{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-.seg button{
-  height:50px;border-radius:14px;border:1px solid var(--panel-b);background:rgba(0,0,0,0.2);
-  color:var(--text);font-size:15px;font-weight:500;cursor:pointer;transition:all .2s;
-}
-.seg button.on{border-color:var(--accent);background:rgba(228,87,46,0.18);color:#fff;box-shadow:inset 0 0 0 1px var(--accent)}
-.error{background:rgba(248,113,113,0.12);border:1px solid rgba(248,113,113,0.35);color:#FECACA;padding:10px 12px;border-radius:12px;font-size:14px}
-
-.btn{
-  display:inline-flex;align-items:center;justify-content:center;gap:8px;height:48px;padding:0 18px;
-  border-radius:14px;border:1px solid transparent;font-size:15px;font-weight:600;cursor:pointer;
-  text-decoration:none;color:var(--text);transition:transform .15s, opacity .2s, background .2s;
-}
-.btn:active{transform:scale(0.98)}
-.btn:disabled{opacity:.5;cursor:not-allowed}
-.btn.block{width:100%}
-.btn.lg{height:56px;font-size:16px;border-radius:16px}
-.btn.primary{background:linear-gradient(135deg,#E4572E,#C2410C);color:#fff;box-shadow:0 12px 30px rgba(228,87,46,0.35)}
-.btn.ghost{background:rgba(255,255,255,0.05);border-color:var(--panel-b)}
-.btn.danger{background:transparent;border-color:rgba(248,113,113,0.4);color:#FCA5A5}
-.btn.danger.solid{background:#DC2626;border-color:#DC2626;color:#fff}
-
-.spinner{width:20px;height:20px;border-radius:50%;border:2.5px solid rgba(255,255,255,0.35);border-top-color:#fff;animation:spin .8s linear infinite;display:inline-block}
-@keyframes spin{to{transform:rotate(360deg)}}
-.loading-row{display:flex;align-items:center;gap:10px;color:var(--muted);margin-top:14px}
-
-.conn-badge{
-  position:fixed;left:50%;bottom:18px;transform:translateX(-50%);display:flex;align-items:center;gap:8px;
-  background:rgba(30,20,20,0.9);border:1px solid rgba(248,113,113,0.35);color:#FECACA;
-  padding:8px 14px;border-radius:999px;font-size:13px;z-index:50;
-}
-.toast{
-  position:fixed;top:16px;left:50%;transform:translateX(-50%);z-index:60;display:flex;align-items:center;gap:8px;
-  padding:10px 16px;border-radius:999px;font-size:14px;font-weight:600;animation:drop .3s ease both;
-  background:rgba(20,26,44,0.95);border:1px solid var(--panel-b);box-shadow:0 12px 30px rgba(0,0,0,0.4);
-}
-.toast.ok{color:#BBF7D0;border-color:rgba(74,222,128,0.35)}
-.toast.error{color:#FECACA;border-color:rgba(248,113,113,0.4)}
-@keyframes drop{from{opacity:0;transform:translate(-50%,-10px)}to{opacity:1;transform:translate(-50%,0)}}
-
-/* ---------- participant ---------- */
-.orbit{position:relative;width:150px;height:150px;margin:14px 0 6px}
-.orbit .core{position:absolute;inset:58px;border-radius:50%;background:var(--accent2);box-shadow:0 0 30px 8px rgba(244,162,123,0.45);animation:breathe 2.4s ease-in-out infinite}
-.orbit .ring{position:absolute;border-radius:50%;border:1px solid rgba(244,162,123,0.35)}
-.orbit .r1{inset:30px;animation:ping 2.4s ease-out infinite}
-.orbit .r2{inset:0;animation:ping 2.4s ease-out .8s infinite}
-@keyframes breathe{50%{transform:scale(1.12)}}
-@keyframes ping{0%{transform:scale(.6);opacity:1}100%{transform:scale(1.15);opacity:0}}
-.stat-pill{display:inline-flex;align-items:center;gap:8px;padding:8px 14px;border-radius:999px;background:rgba(255,255,255,0.06);border:1px solid var(--panel-b);font-size:14px;margin-top:8px}
-
-.team-screen{background:radial-gradient(600px 420px at 50% 18%, rgba(255,255,255,0.05), transparent 70%)}
-.team-screen{background:radial-gradient(600px 420px at 50% 18%, color-mix(in srgb, var(--team) 22%, transparent), transparent 70%)}
-.team-card{
-  border-color:var(--team);background:rgba(255,255,255,0.045);background:color-mix(in srgb, var(--team) 9%, rgba(255,255,255,0.03));
-  box-shadow:0 0 0 1px var(--team), 0 0 40px -6px var(--team), 0 30px 80px rgba(0,0,0,0.45);
-  animation:pop .7s cubic-bezier(.2,1.4,.4,1) both;
-}
-@keyframes pop{0%{opacity:0;transform:scale(.85);filter:brightness(2.2)}60%{filter:brightness(1.3)}100%{opacity:1;transform:none;filter:none}}
-.team-swatch{width:64px;height:64px;border-radius:50%;margin:6px 0 2px;background:var(--team);
-  box-shadow:0 0 0 6px rgba(255,255,255,0.06), 0 0 28px 6px var(--team), 0 0 70px 14px var(--team);animation:swatch 2.6s ease-in-out infinite}
-@keyframes swatch{50%{transform:scale(1.07);box-shadow:0 0 0 8px rgba(255,255,255,0.08), 0 0 36px 10px var(--team), 0 0 90px 20px var(--team)}}
-.team-badge{font-family:'Space Grotesk',Inter,sans-serif;font-size:52px;font-weight:700;line-height:1;color:var(--team);letter-spacing:-0.02em;margin-top:6px;text-shadow:0 0 18px var(--team), 0 0 42px var(--team)}
-.team-meta{color:var(--muted);font-size:14px}
-.mates{width:100%;display:flex;flex-direction:column;gap:8px;margin:14px 0 6px;text-align:left}
-.mate{display:flex;align-items:center;gap:12px;padding:10px 12px;border-radius:14px;background:rgba(0,0,0,0.22);border:1px solid var(--panel-b)}
-.mate.self{border-color:var(--team)}
-.mate em{margin-left:auto;font-style:normal;font-size:12px;font-weight:600;color:var(--team);text-transform:uppercase;letter-spacing:.08em}
-.mate-name{font-size:15px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.avatar{width:34px;height:34px;flex:0 0 34px;border-radius:50%;display:grid;place-items:center;font-size:13px;font-weight:700;color:#0B1020;background:var(--team)}
-
-.quiz-card{gap:14px;align-items:stretch;text-align:left}
-.quiz-top{display:flex;align-items:center;justify-content:space-between;min-height:28px}
-.quiz-count{font-size:13px;font-weight:600;color:var(--muted);letter-spacing:.04em}
-.link-btn{display:inline-flex;align-items:center;gap:4px;background:none;border:none;color:var(--accent2);font-size:14px;font-weight:600;cursor:pointer;padding:4px 0}
-.progress{height:6px;border-radius:999px;background:rgba(255,255,255,0.08);overflow:hidden}
-.progress.lg{height:10px}
-.progress i{display:block;height:100%;border-radius:999px;background:linear-gradient(90deg,#E4572E,#F4A27B);transition:width .4s ease}
-.quiz-q{font-size:23px;line-height:1.25;font-weight:700;margin:6px 0 4px}
-.opts{display:flex;flex-direction:column;gap:10px}
-.opt{
-  display:flex;align-items:center;gap:12px;width:100%;min-height:56px;padding:12px 14px;border-radius:16px;
-  border:1px solid var(--panel-b);background:rgba(0,0,0,0.22);color:var(--text);font-size:16px;font-weight:500;
-  text-align:left;cursor:pointer;transition:border-color .15s, background .15s, transform .1s;
-}
-.opt:active{transform:scale(.985)}
-.opt.on{border-color:var(--accent);background:rgba(228,87,46,0.16);box-shadow:inset 0 0 0 1px var(--accent)}
-.opt-key{width:28px;height:28px;flex:0 0 28px;border-radius:9px;display:grid;place-items:center;font-size:13px;font-weight:700;background:rgba(255,255,255,0.08);color:var(--muted)}
-.opt.on .opt-key{background:var(--accent);color:#fff}
-.opt-text{flex:1}
-.opt-check{color:var(--accent2);flex:0 0 auto}
-
-/* ---------- facilitator ---------- */
-.btn.outline{background:rgba(228,87,46,0.08);border-color:rgba(228,87,46,0.55);color:#FED7AA}
-.live-chip{color:#BBF7D0;background:rgba(74,222,128,0.12)}
-.fac{max-width:640px;margin:0 auto;padding:16px 16px 120px}
-.fac-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:6px 2px 16px}
-.fac-brand{display:flex;align-items:center;gap:12px;min-width:0}
-.fac-title{font-family:'Space Grotesk',Inter,sans-serif;font-weight:700;font-size:18px;white-space:nowrap}
-.fac-sub{color:var(--muted);font-size:13px}
-.live{display:inline-flex;align-items:center;gap:7px;font-size:13px;font-weight:600;color:#BBF7D0;padding:6px 12px;border-radius:999px;background:rgba(74,222,128,0.1);border:1px solid rgba(74,222,128,0.3)}
-.live i{width:8px;height:8px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 0 rgba(74,222,128,0.6);animation:livepulse 1.8s infinite}
-.live.off{color:#FECACA;background:rgba(248,113,113,0.1);border-color:rgba(248,113,113,0.3)}
-.live.off i{background:var(--danger);animation:none}
-@keyframes livepulse{70%{box-shadow:0 0 0 8px rgba(74,222,128,0)}100%{box-shadow:0 0 0 0 rgba(74,222,128,0)}}
-.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:12px}
-.stat{background:var(--panel);border:1px solid var(--panel-b);border-radius:16px;padding:12px 6px;text-align:center}
-.stat b{display:block;font-family:'Space Grotesk',Inter,sans-serif;font-size:24px;line-height:1.1}
-.stat span{font-size:12px;color:var(--muted)}
-.panel{background:var(--panel);border:1px solid var(--panel-b);border-radius:20px;padding:16px;margin-bottom:12px;display:flex;flex-direction:column;gap:12px}
-.panel.quiet{background:transparent;border:none;padding:4px 0}
-.panel-title{font-weight:600;font-size:15px}
-.panel-title.row{display:flex;align-items:center;justify-content:space-between}
-.count-chip{font-size:12px;font-weight:500;color:var(--muted);padding:4px 10px;border-radius:999px;background:rgba(255,255,255,0.06)}
-.stepper{display:grid;grid-template-columns:64px 1fr 64px;gap:10px}
-.stepper button{height:64px;border-radius:16px;border:1px solid var(--panel-b);background:rgba(255,255,255,0.06);color:var(--text);display:grid;place-items:center;cursor:pointer}
-.stepper button:disabled{opacity:.35}
-.stepper button:active{transform:scale(.96)}
-.stepper input{
-  height:64px;width:100%;text-align:center;border-radius:16px;border:1px solid var(--panel-b);background:rgba(0,0,0,0.25);
-  color:var(--text);font-family:'Space Grotesk',Inter,sans-serif;font-size:32px;font-weight:700;outline:none;-moz-appearance:textfield;
-}
-.stepper input::-webkit-outer-spin-button,.stepper input::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
-.stepper input:focus{border-color:var(--accent2)}
-.hint{text-align:center;color:var(--muted);font-size:14px}
-.note{font-size:13px;color:#FDE68A;background:rgba(253,230,138,0.08);border:1px solid rgba(253,230,138,0.25);padding:8px 12px;border-radius:12px}
-.note.accent{color:#FED7AA;background:rgba(228,87,46,0.1);border-color:rgba(228,87,46,0.35)}
-.team-list{display:grid;grid-template-columns:1fr;gap:10px}
-@media (min-width:600px){.team-list{grid-template-columns:1fr 1fr}}
-.team-item{border:1px solid var(--panel-b);border-left:3px solid var(--team);border-radius:14px;padding:12px;background:rgba(0,0,0,0.18)}
-.team-item-head{display:flex;align-items:center;gap:8px;margin-bottom:8px}
-.team-item-head .dot{width:10px;height:10px;border-radius:50%;background:var(--team)}
-.team-item-head b{color:var(--team);font-family:'Space Grotesk',Inter,sans-serif}
-.team-item-meta{margin-left:auto;font-size:12px;color:var(--muted)}
-.chips{display:flex;flex-wrap:wrap;gap:6px}
-.chips.scroll{max-height:240px;overflow:auto}
-.chip{font-size:13px;padding:5px 10px;border-radius:999px;background:rgba(255,255,255,0.07);border:1px solid var(--panel-b)}
-.empty{display:flex;align-items:center;gap:12px;color:var(--muted);font-size:14px;padding:6px 2px}
-.action-bar{
-  position:fixed;left:0;right:0;bottom:0;z-index:40;padding:12px 16px calc(12px + env(safe-area-inset-bottom));
-  background:linear-gradient(to top, rgba(7,10,20,0.98) 60%, rgba(7,10,20,0));
-}
-.action-bar .btn{max-width:608px;margin:0 auto;display:flex}
-.modal{position:fixed;inset:0;z-index:70;background:rgba(3,5,12,0.7);backdrop-filter:blur(4px);display:flex;align-items:flex-end;justify-content:center;padding:16px}
-@media (min-width:600px){.modal{align-items:center}}
-.modal-card{width:100%;max-width:420px;background:#121829;border:1px solid var(--panel-b);border-radius:22px;padding:22px;text-align:center;display:flex;flex-direction:column;gap:10px;animation:rise .25s ease both}
-.modal-icon{width:48px;height:48px;border-radius:14px;display:grid;place-items:center;margin:0 auto 4px;background:rgba(248,113,113,0.12);color:#FCA5A5}
-.modal-card h3{font-size:20px}
-.modal-actions{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:8px}
-
-/* ---------- dashboard ---------- */
-.dash{position:fixed;inset:0;display:flex;overflow:hidden}
-.dash-stage{position:relative;flex:1;min-width:0;height:100%}
-.dash-canvas{position:absolute;inset:0;display:block}
-.dash-head{position:absolute;top:28px;left:40px;display:flex;align-items:center;gap:18px;pointer-events:none}
-.dash-head h1{font-size:34px;font-weight:700;letter-spacing:-0.01em}
-.dash-head p{margin:4px 0 0;color:var(--muted);font-size:16px}
-.dash-tools{position:absolute;top:32px;right:28px;display:flex;align-items:center;gap:10px}
-.live-count{display:flex;align-items:center;gap:8px;padding:10px 16px;border-radius:999px;background:rgba(255,255,255,0.06);border:1px solid var(--panel-b);font-size:15px}
-.live-count b{font-family:'Space Grotesk',Inter,sans-serif;font-size:18px}
-.pulse-dot{width:9px;height:9px;border-radius:50%;background:var(--ok);display:inline-block;animation:livepulse 1.8s infinite}
-.tool-btn{display:inline-flex;align-items:center;gap:8px;height:42px;padding:0 14px;border-radius:999px;border:1px solid var(--panel-b);background:rgba(255,255,255,0.06);color:var(--text);font-size:14px;font-weight:500;cursor:pointer;opacity:.75;transition:opacity .2s}
-.tool-btn:hover{opacity:1}
-.tool-btn.icon{width:42px;padding:0;justify-content:center}
-.dash-conn{position:absolute;left:40px;bottom:20px;display:flex;align-items:center;gap:8px;color:#FECACA;font-size:14px;background:rgba(30,20,20,0.85);border:1px solid rgba(248,113,113,0.35);padding:8px 14px;border-radius:999px}
-
-.qr-panel{width:0;flex:0 0 auto;height:100%;overflow:hidden;transition:width .45s cubic-bezier(.4,0,.2,1);border-left:1px solid transparent}
-.qr-panel.open{width:340px;border-left-color:var(--panel-b)}
-.qr-inner{
-  position:relative;width:340px;height:100%;padding:36px 30px;display:flex;flex-direction:column;justify-content:center;gap:14px;
-  background:linear-gradient(180deg, rgba(255,255,255,0.05), rgba(255,255,255,0.02));backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);
-}
-.qr-inner h2{font-size:24px;line-height:1.2}
-.qr-inner .eyebrow{margin-top:0}
-.qr-close{position:absolute;top:24px;right:20px;width:38px;height:38px;border-radius:50%;border:1px solid var(--panel-b);background:rgba(255,255,255,0.05);color:var(--muted);display:grid;place-items:center;cursor:pointer}
-.qr-close:hover{color:var(--text)}
-.qr-box{background:#fff;border-radius:20px;padding:16px;box-shadow:0 20px 50px rgba(0,0,0,0.45), 0 0 0 6px rgba(244,162,123,0.15)}
-.qr-box svg{width:100%;height:auto;display:block}
-.qr-url{font-family:'Space Grotesk',Inter,sans-serif;font-size:15px;color:var(--accent2);text-align:center;word-break:break-all}
-.qr-steps{display:flex;flex-direction:column;gap:8px;margin-top:4px}
-.qr-steps div{display:flex;align-items:center;gap:10px;font-size:14px;color:var(--muted)}
-.qr-steps span{width:22px;height:22px;flex:0 0 22px;border-radius:50%;display:grid;place-items:center;font-size:12px;font-weight:700;color:#0B1020;background:var(--accent2)}
-.qr-count{display:flex;align-items:center;gap:8px;margin-top:6px;padding-top:14px;border-top:1px solid var(--panel-b);font-size:15px}
-.qr-count b{font-family:'Space Grotesk',Inter,sans-serif;font-size:20px}
-
-@media (max-width:900px){
-  .dash-head{left:20px;top:20px}
-  .dash-head h1{font-size:24px}
-  .dash-tools{top:22px;right:16px}
-  .qr-panel.open{width:280px}
-  .qr-inner{width:280px;padding:28px 20px}
-}
-`;
