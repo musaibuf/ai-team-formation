@@ -196,16 +196,20 @@ function similarity(p, members, skip = null) {
   return s;
 }
 
-// 1) women go to teams without a woman first  2) only the smallest teams qualify
-// 3) among those, the team least like this person wins (random tie break)
+// Works the same for both genders, so it doesn't matter which one is the minority:
+// 1) teams with nobody of this person's gender come first
+// 2) only the smallest of those qualify
+// 3) then the fewest people of this gender
+// 4) then the team least like this person (random tie break)
 function pickTeam(groups, p) {
   let pool = groups.map((_, i) => i);
-  if (p.gender === 'female') {
-    const noWoman = pool.filter((i) => !groups[i].some((m) => m.gender === 'female'));
-    if (noWoman.length) pool = noWoman;
-  }
+  const sameGender = (i) => groups[i].reduce((n, m) => n + (m.gender === p.gender ? 1 : 0), 0);
+  const none = pool.filter((i) => sameGender(i) === 0);
+  if (none.length) pool = none;
   const min = Math.min(...pool.map((i) => groups[i].length));
   pool = pool.filter((i) => groups[i].length === min);
+  const fewest = Math.min(...pool.map(sameGender));
+  pool = pool.filter((i) => sameGender(i) === fewest);
   let best = [];
   let bestScore = Infinity;
   for (const i of pool) {
@@ -257,10 +261,12 @@ function formTeams(requested) {
   const k = Math.min(requested, people.length);
   const groups = Array.from({ length: k }, () => []);
   const women = shuffle(people.filter((p) => p.gender === 'female'));
-  const rest = shuffle(people.filter((p) => p.gender !== 'female'));
+  const men = shuffle(people.filter((p) => p.gender !== 'female'));
+  // Whichever gender is fewer is spread first, so it lands one-per-team before anyone doubles up.
+  const order = women.length <= men.length ? [...women, ...men] : [...men, ...women];
   buildSimCache(people);
   try {
-    for (const p of [...women, ...rest]) groups[pickTeam(groups, p)].push(p);
+    for (const p of order) groups[pickTeam(groups, p)].push(p);
     optimise(groups);
   } finally {
     simCache = null;
