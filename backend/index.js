@@ -22,49 +22,54 @@ const MAX_NAME = 20;
 
 /* ---------- quiz ---------- */
 
-// weight = how strongly the team builder spreads apart people who gave the same answer
+// weight  = how strongly the team builder spreads apart people who answered alike
+// ordinal = options are in order (junior to senior, young to old, new to long-time).
+//           Two answers count as alike by how close they are, so each team gets the
+//           whole range (a junior, a mid-level, a senior) rather than just neighbours.
 const QUESTIONS = [
   {
-    weight: 1.5,
-    text: "Figuring out something new, what's your instinct?",
-    options: ['Read the instructions', 'Watch someone else do it first', 'Start pressing buttons', 'Ask a person'],
-  },
-  {
-    weight: 1,
-    text: 'First week somewhere new, which are you?',
-    options: ['The one asking all the questions', 'The one watching quietly first'],
-  },
-  {
-    weight: 1.5,
-    text: "When you're stuck, how long before you ask for help?",
-    options: ['Straight away', 'About an hour', "I'll search until 2am", "I'll suffer in silence"],
+    weight: 3,
+    ordinal: true,
+    text: "What's your position level?",
+    options: ['Intern / Trainee', 'Officer / Executive', 'Assistant Manager', 'Deputy Manager', 'Manager', 'Senior Manager', 'Head / Director and above'],
   },
   {
     weight: 2,
-    text: 'Where do you call home?',
-    options: ['Karachi', 'Lahore', 'Islamabad or Rawalpindi', 'Peshawar', 'Quetta', 'Somewhere smaller'],
+    ordinal: true,
+    text: 'Your age',
+    options: ['Under 25', '25 to 29', '30 to 34', '35 to 39', '40 to 49', '50 and above'],
+  },
+  {
+    weight: 3,
+    ordinal: true,
+    text: 'How long have you been with the organization?',
+    options: ['Less than 6 months', '6 months to 1 year', '1 to 3 years', '3 to 5 years', '5 to 10 years', 'More than 10 years'],
+  },
+  {
+    weight: 3,
+    text: 'Which function are you in?',
+    options: ['Sales / Commercial', 'Operations', 'Finance', 'HR / People', 'Marketing', 'Tech / IT', 'Other'],
   },
   {
     weight: 0.5,
-    text: 'Your order when you actually get to choose:',
-    options: ['Chai', 'Coffee', 'Cold drink', 'Juice', 'Just water'],
-  },
-  {
-    weight: 1,
-    text: "If this career didn't exist, what would you be doing?",
-    options: ['Musician', 'Athlete', 'Chef', 'Teacher', 'Running my own thing', 'No idea yet'],
+    text: "What's your go-to drink?",
+    options: ['Soft drink', 'Coffee', 'Chai', 'Just water'],
   },
   {
     weight: 0.5,
-    text: 'Your group chat personality:',
-    options: ['Sends voice notes', 'Replies with stickers', 'Leaves you on seen', 'Types an essay', 'Has the group muted'],
-  },
-  {
-    weight: 0.25,
-    text: 'Your phone battery right now:',
-    options: ['100%', 'Above 50%', 'Above 15%', 'Dying, like always'],
+    text: 'Which city in Pakistan has the best food?',
+    options: ['Lahore', 'Karachi', 'Peshawar', 'Multan'],
   },
 ];
+
+// How alike two answers to one question are, from 0 (nothing alike) to the question's weight.
+function answerSim(q, x, y) {
+  const Q = QUESTIONS[q];
+  if (x == null || y == null || x < 0 || y < 0) return 0;
+  if (!Q.ordinal) return x === y ? Q.weight : 0;
+  const closeness = 1 - Math.abs(x - y) / (Q.options.length - 1);
+  return Q.weight * closeness * closeness;
+}
 const PUBLIC_QUESTIONS = QUESTIONS.map(({ text, options }) => ({ text, options }));
 
 /* ---------- team colours (6-digit hex, the screens append alpha) ---------- */
@@ -158,7 +163,6 @@ let simCache = null;
 function buildSimCache(people) {
   const n = people.length;
   const qn = QUESTIONS.length;
-  const W = QUESTIONS.map((q) => q.weight);
   const vec = new Int8Array(n * qn).fill(-1);
   people.forEach((p, i) => {
     p._si = i;
@@ -169,10 +173,7 @@ function buildSimCache(people) {
   for (let i = 0; i < n; i++) {
     for (let j = i + 1; j < n; j++) {
       let v = 0;
-      for (let q = 0; q < qn; q++) {
-        const x = vec[i * qn + q];
-        if (x >= 0 && x === vec[j * qn + q]) v += W[q];
-      }
+      for (let q = 0; q < qn; q++) v += answerSim(q, vec[i * qn + q], vec[j * qn + q]);
       S[i * n + j] = v;
       S[j * n + i] = v;
     }
@@ -186,7 +187,7 @@ function pairSim(a, b) {
   const B = state.answers.get(b.id);
   if (!A || !B) return 0;
   let s = 0;
-  for (const [q, opt] of A) if (B.get(q) === opt) s += QUESTIONS[q].weight;
+  for (const [q, opt] of A) s += answerSim(q, opt, B.get(q));
   return s;
 }
 
