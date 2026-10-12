@@ -1356,7 +1356,7 @@ function FacilitatorView() {
           {sessionState === 'idle' && (
             <>
               <p style={{ margin: '0 0 18px', fontSize: 16, color: 'var(--ink-dim)' }}>
-                Once you start, every joined phone gets all {questions.length || 8} questions at once, people answer at their own pace.
+                Once you start, every joined phone gets all {questions.length || 6} questions at once, people answer at their own pace.
               </p>
               <button className="lc-btn lc-btn-primary" onClick={startQuiz} disabled={!connected} style={{ width: '100%' }}>Start the quiz</button>
             </>
