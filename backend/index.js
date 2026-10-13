@@ -256,19 +256,79 @@ function optimise(groups) {
   }
 }
 
-function formTeams(requested) {
-  const people = [...state.participants.values()];
-  if (people.length < 2) return { ok: false, error: 'At least 2 people are needed to make teams.' };
-  const k = Math.min(requested, people.length);
+// Final pass: try every same-gender swap between every pair of teams and keep any that
+// makes both teams less alike, until no swap helps. Time-boxed so huge rooms never stall.
+function polish(groups, budgetMs = 400) {
+  const deadline = Date.now() + budgetMs;
+  let improved = true;
+  while (improved && Date.now() < deadline) {
+    improved = false;
+    for (let a = 0; a < groups.length; a++) {
+      for (let b = a + 1; b < groups.length; b++) {
+        const A = groups[a];
+        const B = groups[b];
+        for (let i = 0; i < A.length; i++) {
+          for (let j = 0; j < B.length; j++) {
+            const x = A[i];
+            const y = B[j];
+            if (x.gender !== y.gender) continue;
+            const delta = similarity(y, A, x) - similarity(x, A) + (similarity(x, B, y) - similarity(y, B));
+            if (delta < -1e-9) {
+              A[i] = y;
+              B[j] = x;
+              improved = true;
+            }
+          }
+        }
+        if (Date.now() >= deadline) return;
+      }
+    }
+  }
+}
+
+// Builds the teams several times from different random starting points (within a short
+// time budget) and keeps the most mixed result. Every attempt keeps the gender balance
+// and equal sizes; only the mix of answers differs between attempts.
+const BUILD_BUDGET_MS = 250;
+const MAX_ATTEMPTS = 12;
+
+// Total "alikeness" inside all teams. Lower = more mixed teams.
+function totalSimilarity(groups) {
+  let s = 0;
+  for (const g of groups) for (let i = 0; i < g.length; i++) for (let j = i + 1; j < g.length; j++) s += pairSim(g[i], g[j]);
+  return s;
+}
+
+function buildOnce(people, k) {
   const groups = Array.from({ length: k }, () => []);
   const women = shuffle(people.filter((p) => p.gender === 'female'));
   const men = shuffle(people.filter((p) => p.gender !== 'female'));
   // Whichever gender is fewer is spread first, so it lands one-per-team before anyone doubles up.
   const order = women.length <= men.length ? [...women, ...men] : [...men, ...women];
+  for (const p of order) groups[pickTeam(groups, p)].push(p);
+  optimise(groups);
+  polish(groups);
+  return groups;
+}
+
+function formTeams(requested) {
+  const people = [...state.participants.values()];
+  if (people.length < 2) return { ok: false, error: 'At least 2 people are needed to make teams.' };
+  const k = Math.min(requested, people.length);
+  let groups = null;
   buildSimCache(people);
   try {
-    for (const p of order) groups[pickTeam(groups, p)].push(p);
-    optimise(groups);
+    const start = Date.now();
+    let bestScore = Infinity;
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+      const g = buildOnce(people, k);
+      const score = totalSimilarity(g);
+      if (score < bestScore) {
+        bestScore = score;
+        groups = g;
+      }
+      if (Date.now() - start > BUILD_BUDGET_MS) break;
+    }
   } finally {
     simCache = null;
   }
