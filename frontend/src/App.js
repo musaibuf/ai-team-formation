@@ -563,7 +563,7 @@ function ParticipantView() {
             <h2 className="lc-h2">{question.text}</h2>
             <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
               {question.options.map((opt, i) => (
-                <button key={`${quizIndex}-${i}`} disabled={locked} onClick={() => handleAnswer(i)} style={{ animationDelay: `${i * 60}ms` }}
+                <button key={`${quizIndex}-${i}`} disabled={locked} onClick={() => handleAnswer(i)} style={{ animationDelay: `${Math.min(i, 8) * 50}ms` }}
                   className={`lc-option lc-rise ${selectedOption === i ? 'lc-selected' : ''} ${locked && selectedOption !== i ? 'lc-dimmed' : ''}`}>
                   {opt}
                 </button>
